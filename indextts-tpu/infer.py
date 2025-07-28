@@ -1,0 +1,778 @@
+import os
+import sys
+import time
+from subprocess import CalledProcessError
+from typing import Dict, List, Tuple
+
+import torch
+import torchaudio
+import torch.nn.functional as F
+from torch.nn.utils.rnn import pad_sequence
+from omegaconf import OmegaConf
+from tqdm import tqdm
+
+import ctypes
+import numpy as np
+from untool import (
+    get_model_info_p,
+    convert_model_info,
+    move_to_device,
+    compile_io_addr,
+    fill_api_info,
+    run_model,
+    free_model,
+    find_net_num,
+    untensor_create,
+    untensor_destroy,
+    untensor_sync,
+    untensor_s2d_bytes,
+    untensor_d2d_bytes_offset,
+    untensor_malloc_device,
+    untensor_free_device,
+)
+
+from indextts.utils.feature_extractors import MelSpectrogramFeatures
+from indextts.utils.front import TextNormalizer, TextTokenizer
+
+import warnings
+
+warnings.filterwarnings("ignore", category=FutureWarning)
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+class IndexTTS:
+    def __init__(
+        self,
+        cfg_path="checkpoints/config.yaml",
+        model_dir="checkpoints",
+        device_id: int = 0,
+    ):
+        self.device = "cpu"
+        self.is_fp16 = False
+        self.use_cuda_kernel = False
+        self.device_id = device_id
+
+        self.cfg = OmegaConf.load(cfg_path)
+        self.model_dir = model_dir
+        self.stop_mel_token = self.cfg.gpt.stop_mel_token
+
+        self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
+        self.normalizer = TextNormalizer()
+        self.normalizer.load()
+        print(">> TextNormalizer loaded")
+        self.tokenizer = TextTokenizer(self.bpe_path, self.normalizer)
+        print(">> bpe model loaded from:", self.bpe_path)
+
+        self.cache_audio_prompt = None
+        self.cache_cond_mel = None
+        self.model_version = 1.5
+        self.stop_text_token = 0
+        self.start_text_token = 1
+        self.start_mel_token = 8192
+        self.stop_mel_token = 8193
+        self.mel_length_compression = 1024
+        self.SEQLEN = 256
+
+        self._init_bmodel(self.cfg.model_path, self.device_id)
+
+    def _init_bmodel(self, model_path: str, device_id: int):
+        self.model_info_p = get_model_info_p(model_path, device_id)
+        move_to_device(self.model_info_p)
+        compile_io_addr(self.model_info_p)
+        fill_api_info(self.model_info_p)
+        self.model_info_c_p = convert_model_info(self.model_info_p)
+        self.bm_handle = self.model_info_c_p.contents.bm_handle
+        self._init_idx()
+        self._init_tensors()
+        self.free_model = free_model
+        self.untensor_destroy = untensor_destroy
+
+    def _init_idx(self):
+        self.bigvgan_idx = 57
+        self.speaker_encoder_idx = 56
+        self.final_norm = 55
+        self.ln_f_idx = 54
+        self.greedy_head_idx = 53
+        self.lm_head_idx = 52
+        self.conds_encoder_idx = 51
+        self.text_embedding_idx = 50
+        self.mel_embedding_idx = 49
+        self.inference_model_embedding_idx = 48
+        self.num_blocks = 24
+        self.block_ids = []
+        self.block_cache_ids = []
+        for i in range(self.num_blocks):
+            self.block_ids.append(2 * i)
+            self.block_cache_ids.append(2 * i + 1)
+
+    def _init_tensors(self):
+        net_num = self.model_info_c_p.contents.net_num
+        self.input_tensors = []
+        self.output_tensors = []
+        for i in range(net_num):
+            net_x_input_tensors = []
+            net_x_output_tensors = []
+            stage_info = self.model_info_c_p.contents.nets[i].stages[0]
+            io_alone = stage_info.io_alone
+            if io_alone:
+                io_device = stage_info.io_device
+            else:
+                io_device = self.model_info_c_p.contents.neuron_device
+            input_num = stage_info.input_num
+            output_num = stage_info.output_num
+            for i in range(input_num):
+                src_tensor = stage_info.input_tensor[i]
+                dst_tensor = untensor_create()
+                dst_tensor.contents.name = src_tensor.name
+                dst_tensor.contents.dtype = src_tensor.data_type
+                dst_tensor.contents.dims = src_tensor.dims
+                dst_tensor.contents.shape = src_tensor.shape
+                dst_tensor.contents.size = src_tensor.size
+                dst_tensor.contents.device_id = self.device_id
+                dst_tensor.contents.bm_handle = self.bm_handle
+                dst_tensor.contents.is_in_device = True
+                dst_tensor.contents.addr = stage_info.input_tensor_global_addr[i]
+                dst_tensor.contents.device_start = io_device.addr
+                dst_tensor.contents.device_size = io_device.size
+                dst_tensor.contents.dmabuf_fd = io_device.dmabuf_fd
+                dst_tensor.contents.reserved = io_device.reserved
+                dst_tensor.contents.rawflags = io_device.rawflags
+                dst_tensor.contents.offset = dst_tensor.contents.addr - io_device.addr
+                net_x_input_tensors.append(dst_tensor)
+            for i in range(output_num):
+                src_tensor = stage_info.output_tensor[i]
+                dst_tensor = untensor_create()
+                dst_tensor.contents.name = src_tensor.name
+                dst_tensor.contents.dtype = src_tensor.data_type
+                dst_tensor.contents.dims = src_tensor.dims
+                dst_tensor.contents.shape = src_tensor.shape
+                dst_tensor.contents.size = src_tensor.size
+                dst_tensor.contents.device_id = self.device_id
+                dst_tensor.contents.bm_handle = self.bm_handle
+                dst_tensor.contents.is_in_device = True
+                dst_tensor.contents.addr = stage_info.output_tensor_global_addr[i]
+                dst_tensor.contents.device_start = io_device.addr
+                dst_tensor.contents.device_size = io_device.size
+                dst_tensor.contents.dmabuf_fd = io_device.dmabuf_fd
+                dst_tensor.contents.reserved = io_device.reserved
+                dst_tensor.contents.rawflags = io_device.rawflags
+                dst_tensor.contents.offset = dst_tensor.contents.addr - io_device.addr
+                net_x_output_tensors.append(dst_tensor)
+            self.input_tensors.append(net_x_input_tensors)
+            self.output_tensors.append(net_x_output_tensors)
+
+    def s2d_bytes(self, src, data, byte_size):
+        untensor_s2d_bytes(src, data, byte_size)
+
+    def d2d_bytes_offset(self, dst, src, dst_offset, src_offset, byte_size):
+        untensor_d2d_bytes_offset(
+            self.bm_handle, dst, src, dst_offset, src_offset, byte_size
+        )
+
+    def run(self, net_idx: int, stage_idx: int = 0):
+        run_model(self.model_info_p, net_idx, stage_idx)
+
+    def bigvgan(self, latent: np.ndarray, cond_mel: np.ndarray):
+        latent_ptr = ctypes.c_void_p(latent.ctypes.data)
+        cond_mel_ptr = ctypes.c_void_p(cond_mel.ctypes.data)
+
+        in_tensor_ = self.input_tensors[self.speaker_encoder_idx][0]
+        out_tensor_ = self.output_tensors[self.speaker_encoder_idx][0]
+        in_tensor_0 = self.input_tensors[self.bigvgan_idx][0]
+        in_tensor_1 = self.input_tensors[self.bigvgan_idx][1]
+        out_tensor_0 = self.output_tensors[self.bigvgan_idx][0]
+
+        self.s2d_bytes(in_tensor_, cond_mel_ptr, cond_mel.nbytes)
+        self.s2d_bytes(in_tensor_0, latent_ptr, latent.nbytes)
+        self.run(self.speaker_encoder_idx)
+        self.d2d_bytes_offset(in_tensor_1, out_tensor_, 0, 0, out_tensor_.contents.size)
+        self.run(self.bigvgan_idx)
+
+        untensor_sync(out_tensor_0, False, True)
+        audio = ctypes.cast(
+            out_tensor_0.contents.data, ctypes.POINTER(ctypes.c_float)
+        ).contents.value
+        return audio
+
+    def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
+        inp = F.pad(input, (1, 0), value=start_token)
+        tar = F.pad(input, (0, 1), value=stop_token)
+        return inp, tar
+
+    def set_mel_padding(self, mel_input_tokens, mel_lengths):
+        """
+        Given mel tokens that are derived from a padded audio clip and the actual lengths of each batch element in
+        that audio clip, reformats the tokens with STOP_MEL_TOKEN in place of the zero padding. This is required
+        preformatting to create a working TTS model.
+        """
+        for b in range(len(mel_lengths)):
+            # Due to the convolutional nature of how these tokens are generated,
+            # it would be best if the model predicts a token past the actual last token.
+            actual_end = mel_lengths[b]
+            if actual_end < mel_input_tokens.shape[-1]:
+                mel_input_tokens[b, actual_end:] = self.stop_mel_token
+        return mel_input_tokens
+
+    def set_text_padding(self, text_input_tokens, text_lengths):
+        """
+        Given mel tokens that are derived from a padded audio clip and the actual lengths of each batch element in
+        that audio clip, reformats the tokens with STOP_MEL_TOKEN in place of the zero padding. This is required
+        preformatting to create a working TTS model.
+        """
+        for b in range(len(text_lengths)):
+            # Due to the convolutional nature of how these tokens are generated,
+            # it would be best if the model predicts a token past the actual last token.
+            actual_end = text_lengths[b]
+            if actual_end < text_input_tokens.shape[-1]:
+                text_input_tokens[b, actual_end:] = self.stop_text_token
+        return text_input_tokens
+
+    def gpt(self, cond_mel_ptr, text_inputs, text_lengths, mel_codes, wav_lengths,
+                cond_mel_lengths):
+
+        in_tensor = self.input_tensors[self.conds_encoder_idx][0]
+        conds = self.output_tensors[self.conds_encoder_idx][0]
+        self.s2d_bytes(in_tensor, cond_mel_ptr, in_tensor.contents.size)
+        self.run(self.conds_encoder_idx)
+
+        mel_codes_lengths = torch.ceil(wav_lengths / self.mel_length_compression).long() + 1
+        mel_codes = self.set_mel_padding(mel_codes, mel_codes_lengths)
+        text_inputs = self.set_text_padding(text_inputs, text_lengths)
+        text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
+        mel_codes = F.pad(mel_codes, (0, 1), value=self.stop_mel_token)
+
+
+
+
+
+
+        
+
+
+
+        return latent
+
+    def inference_speech(self, speech_conditioning_mel, text_inputs):
+        speech_conditioning_mel_ptr = ctypes.c_void_p(
+            speech_conditioning_mel.ctypes.data
+        )
+        get_conditioning_in = self.input_tensors[self.conds_encoder_idx][0]
+        self.s2d_bytes(
+            get_conditioning_in,
+            speech_conditioning_mel_ptr,
+            speech_conditioning_mel.nbytes,
+        )
+        self.run(self.conds_encoder_idx)
+
+        L = text_inputs.shape[1]
+        self.text_length = L
+        text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
+        text_inputs, _ = self.build_aligned_inputs_and_targets(
+            text_inputs, self.start_text_token, self.stop_text_token
+        )
+        text_inputs = F.pad(
+            text_inputs, (0, 256 - text_inputs.size(1)), value=self.stop_text_token
+        )
+        text_inputs = text_inputs.cpu().numpy()
+        text_inputs_ptr = ctypes.c_void_p(text_inputs.ctypes.data)
+
+        text_emb_in = self.input_tensors[self.text_embedding_idx][0]
+        self.s2d_bytes(text_emb_in, text_inputs_ptr, text_inputs.nbytes)
+        self.run(self.text_embedding_idx)
+        codes = self._inference_speech_generate()
+        return torch.tensor(codes)
+
+    def _inference_speech_generate(self):
+        self.token_length = self.text_length
+        token = self.start_mel_token
+
+        first = True
+        codes = []
+        while self.token_length < self.SEQLEN and token != self.stop_mel_token:
+            input_ids = np.array([token], dtype=np.int32)
+            input_ids_ptr = ctypes.c_void_p(input_ids.ctypes.data)
+            in_tensor = self.input_tensors[self.inference_model_embedding_idx][0]
+            self.s2d_bytes(in_tensor, input_ids_ptr, input_ids.nbytes)
+            self.run(self.inference_model_embedding_idx)
+
+            # gpt2 blocks
+            if first:
+                self._gpt_forword_first()
+                out_tensor = self.output_tensors[self.block_ids[-1]][0]
+                first = False
+            else:
+                self._gpt_forward_next()
+                out_tensor = self.output_tensors[self.block_cache_ids[-1]][0]
+
+            # lm_head
+            in_tensor = self.input_tensors[self.lm_head_idx][0]
+            self.d2d_bytes_offset(
+                in_tensor,
+                out_tensor,
+                0,
+                0,
+                out_tensor.contents.size,
+            )
+            self.run(self.lm_head_idx)
+            out_tensor = self.output_tensors[self.lm_head_idx][0]
+
+            # greedy_head
+            in_tensor = self.input_tensors[self.greedy_head_idx][0]
+
+            self.d2d_bytes_offset(
+                in_tensor,
+                out_tensor,
+                0,
+                0,
+                out_tensor.contents.size,
+            )
+            self.run(self.greedy_head_idx)
+            out_tensor = self.output_tensors[self.greedy_head_idx][0]
+
+            # get token
+            untensor_sync(out_tensor, False, True)
+            token = ctypes.cast(
+                out_tensor.contents.data, ctypes.POINTER(ctypes.c_int32)
+            ).contents.value
+            codes.append(token)
+            self.token_length += 1
+
+        return codes
+
+    def _gpt_forword_first(self):
+        attn_mask_ptr = self.get_first_mask_ptr(self.SEQLEN, self.token_length)
+        out_tensor = self.output_tensors[self.block_ids[0]][0]
+        conds = self.output_tensors[self.conds_encoder_idx][0]  # [1, 32, 1280]
+        text_emb = self.output_tensors[self.text_embedding_idx][0]  # token_length
+        text_emb2 = self.output_tensors[self.inference_model_embedding_idx][0]
+        bytes_size = conds.contents.size // 32
+        delta = self.SEQLEN - self.token_length - 32
+
+        for i in range(self.num_blocks):
+            id = self.block_ids[i]
+            in_tensor_0 = self.input_tensors[id][0]
+            in_tensor_1 = self.input_tensors[id][1]
+
+            if i == 0:
+                self.d2d_bytes_offset(in_tensor_0, conds, 0, 0, conds.contents.size)
+                self.d2d_bytes_offset(
+                    in_tensor_0,
+                    text_emb,
+                    conds.contents.size,
+                    0,
+                    bytes_size * self.token_length,
+                )
+                self.d2d_bytes_offset(
+                    in_tensor_0,
+                    text_emb2,
+                    bytes_size * (self.token_length + 32),
+                    0,
+                    bytes_size * delta,
+                )
+                self.s2d_bytes(in_tensor_1, attn_mask_ptr, 2 * self.SEQLEN)
+            else:
+                self.d2d_bytes_offset(
+                    in_tensor_0, out_tensor, 0, 0, out_tensor.contents.size
+                )
+
+            self.run(id)
+
+            out_tensor = self.output_tensors[id][0]
+            cache_id = self.block_cache_ids[i]
+            self.d2d_bytes_offset(
+                self.input_tensors[cache_id][2],
+                self.output_tensors[id][1],
+                0,
+                0,
+                self.output_tensors[id][1].contents.size,
+            )
+            self.d2d_bytes_offset(
+                self.input_tensors[cache_id][3],
+                self.output_tensors[id][2],
+                0,
+                0,
+                self.output_tensors[id][2].contents.size,
+            )
+
+        # ln_f
+        in_tensor = self.input_tensors[self.ln_f_idx][0]
+        src_offset = bytes_size * (self.token_length - 1)
+        self.d2d_bytes_offset(in_tensor, out_tensor, 0, src_offset, bytes_size)
+        self.run(self.ln_f_idx)
+
+    def _gpt_forward_next(self):
+        attn_mask_ptr = self.get_next_mask_ptr(self.SEQLEN, self.token_length)
+        out_tensor = self.output_tensors[self.inference_model_embedding_idx][0]
+        block_cache_0 = self.block_cache_ids[0]
+        bytes_size = self.output_tensors[block_cache_0][1].contents.size
+        dst_offset = bytes_size * (self.token_length - 1)
+        for i in range(self.num_blocks):
+            id = self.block_cache_ids[i]
+            self.d2d_bytes_offset(
+                self.input_tensors[id][0], out_tensor, 0, 0, out_tensor.contents.size
+            )
+            if i == 0:
+                self.s2d_bytes(
+                    self.input_tensors[id][1], attn_mask_ptr, 2 * (self.SEQLEN + 1)
+                )
+            else:
+                self.d2d_bytes_offset(
+                    self.input_tensors[id][1],
+                    self.input_tensors[block_cache_0][2],
+                    0,
+                    0,
+                    2 * (self.SEQLEN + 1),
+                )
+
+            self.run(id)
+            out_tensor = self.output_tensors[id][0]
+            self.d2d_bytes_offset(
+                self.input_tensors[id][2],
+                self.output_tensors[id][1],
+                dst_offset,
+                0,
+                bytes_size,
+            )
+            self.d2d_bytes_offset(
+                self.input_tensors[id][3],
+                self.output_tensors[id][2],
+                dst_offset,
+                0,
+                bytes_size,
+            )
+
+        # ln_f
+        in_tensor = self.input_tensors[self.ln_f_idx][0]
+        self.d2d_bytes_offset(
+            in_tensor, out_tensor, 0, dst_offset, out_tensor.contents.size
+        )
+        self.run(self.ln_f_idx)
+
+    def get_first_mask_ptr(self, seq_len, token_len, bf16=True):
+        if bf16:
+            MASK = 0xC61C
+        else:
+            MASK = 0xF0E2
+        self._attn_mask = np.zeros(seq_len, dtype=np.uint16)
+        self._attn_mask[token_len - 1 : seq_len] = MASK
+        return ctypes.c_void_p(self._attn_mask.ctypes.data)
+
+    def get_next_mask_ptr(self, seq_len, token_len, bf16=True):
+        if bf16:
+            MASK = 0xC61C  # 代表 bfloat16 格式下的 -9984
+        else:
+            MASK = 0xF0E2  # 代表 float16 格式下的 -9984
+        self._attn_mask = np.zeros(seq_len + 1, dtype=np.uint16)
+        self._attn_mask[token_len - 1 : seq_len] = MASK
+        return ctypes.c_void_p(self._attn_mask.ctypes.data)
+
+    def remove_long_silence(
+        self, codes: torch.Tensor, silent_token=52, max_consecutive=30
+    ):
+        """
+        Shrink special tokens (silent_token and stop_mel_token) in codes
+        codes: [B, T]
+        """
+        code_lens = []
+        codes_list = []
+        device = codes.device
+        dtype = codes.dtype
+        isfix = False
+        for i in range(0, codes.shape[0]):
+            code = codes[i]
+            if not torch.any(code == self.stop_mel_token).item():
+                len_ = code.size(0)
+            else:
+                stop_mel_idx = (code == self.stop_mel_token).nonzero(as_tuple=False)
+                len_ = stop_mel_idx[0].item() if len(stop_mel_idx) > 0 else code.size(0)
+
+            count = torch.sum(code == silent_token).item()
+            if count > max_consecutive:
+                # code = code.cpu().tolist()
+                ncode_idx = []
+                n = 0
+                for k in range(len_):
+                    assert code[k] != self.stop_mel_token, (
+                        f"stop_mel_token {self.stop_mel_token} should be shrinked here"
+                    )
+                    if code[k] != silent_token:
+                        ncode_idx.append(k)
+                        n = 0
+                    elif code[k] == silent_token and n < 10:
+                        ncode_idx.append(k)
+                        n += 1
+                    # if (k == 0 and code[k] == 52) or (code[k] == 52 and code[k-1] == 52):
+                    #    n += 1
+                # new code
+                len_ = len(ncode_idx)
+                codes_list.append(code[ncode_idx])
+                isfix = True
+            else:
+                # shrink to len_
+                codes_list.append(code[:len_])
+            code_lens.append(len_)
+        if isfix:
+            if len(codes_list) > 1:
+                codes = pad_sequence(
+                    codes_list, batch_first=True, padding_value=self.stop_mel_token
+                )
+            else:
+                codes = codes_list[0].unsqueeze(0)
+        else:
+            # unchanged
+            pass
+        # clip codes to max length
+        max_len = max(code_lens)
+        if max_len < codes.shape[1]:
+            codes = codes[:, :max_len]
+        code_lens = torch.tensor(code_lens, dtype=torch.long, device=device)
+        return codes, code_lens
+
+    def bucket_sentences(self, sentences, bucket_max_size=4) -> List[List[Dict]]:
+        """
+        Sentence data bucketing.
+        if ``bucket_max_size=1``, return all sentences in one bucket.
+        """
+        outputs: List[Dict] = []
+        for idx, sent in enumerate(sentences):
+            outputs.append({"idx": idx, "sent": sent, "len": len(sent)})
+
+        if len(outputs) > bucket_max_size:
+            # split sentences into buckets by sentence length
+            buckets: List[List[Dict]] = []
+            factor = 1.5
+            last_bucket = None
+            last_bucket_sent_len_median = 0
+
+            for sent in sorted(outputs, key=lambda x: x["len"]):
+                current_sent_len = sent["len"]
+                if current_sent_len == 0:
+                    print(">> skip empty sentence")
+                    continue
+                if (
+                    last_bucket is None
+                    or current_sent_len >= int(last_bucket_sent_len_median * factor)
+                    or len(last_bucket) >= bucket_max_size
+                ):
+                    # new bucket
+                    buckets.append([sent])
+                    last_bucket = buckets[-1]
+                    last_bucket_sent_len_median = current_sent_len
+                else:
+                    # current bucket can hold more sentences
+                    last_bucket.append(sent)  # sorted
+                    mid = len(last_bucket) // 2
+                    last_bucket_sent_len_median = last_bucket[mid]["len"]
+            last_bucket = None
+            # merge all buckets with size 1
+            out_buckets: List[List[Dict]] = []
+            only_ones: List[Dict] = []
+            for b in buckets:
+                if len(b) == 1:
+                    only_ones.append(b[0])
+                else:
+                    out_buckets.append(b)
+            if len(only_ones) > 0:
+                # merge into previous buckets if possible
+                # print("only_ones:", [(o["idx"], o["len"]) for o in only_ones])
+                for i in range(len(out_buckets)):
+                    b = out_buckets[i]
+                    if len(b) < bucket_max_size:
+                        b.append(only_ones.pop(0))
+                        if len(only_ones) == 0:
+                            break
+                # combined all remaining sized 1 buckets
+                if len(only_ones) > 0:
+                    out_buckets.extend(
+                        [
+                            only_ones[i : i + bucket_max_size]
+                            for i in range(0, len(only_ones), bucket_max_size)
+                        ]
+                    )
+            return out_buckets
+        return [outputs]
+
+    def pad_tokens_cat(self, tokens: List[torch.Tensor]) -> torch.Tensor:
+        if self.model_version and self.model_version >= 1.5:
+            # 1.5版本以上，直接使用stop_text_token 右侧填充，填充到最大长度
+            # [1, N] -> [N,]
+            tokens = [t.squeeze(0) for t in tokens]
+            return pad_sequence(
+                tokens,
+                batch_first=True,
+                padding_value=self.cfg.gpt.stop_text_token,
+                padding_side="right",
+            )
+        max_len = max(t.size(1) for t in tokens)
+        outputs = []
+        for tensor in tokens:
+            pad_len = max_len - tensor.size(1)
+            if pad_len > 0:
+                n = min(8, pad_len)
+                tensor = torch.nn.functional.pad(
+                    tensor, (0, n), value=self.cfg.gpt.stop_text_token
+                )
+                tensor = torch.nn.functional.pad(
+                    tensor, (0, pad_len - n), value=self.cfg.gpt.start_text_token
+                )
+            tensor = tensor[:, :max_len]
+            outputs.append(tensor)
+        tokens = torch.cat(outputs, dim=0)
+        return tokens
+
+    def infer(
+        self,
+        audio_prompt,
+        text,
+        output_path,
+        verbose=False,
+        max_text_tokens_per_sentence=120,
+    ):
+        print(">> start inference...")
+        if verbose:
+            print(f"origin text:{text}")
+        start_time = time.perf_counter()
+
+        # 如果参考音频改变了，才需要重新生成 cond_mel, 提升速度
+        if self.cache_cond_mel is None or self.cache_audio_prompt != audio_prompt:
+            audio, sr = torchaudio.load(audio_prompt)
+            audio = torch.mean(audio, dim=0, keepdim=True)
+            if audio.shape[0] > 1:
+                audio = audio[0].unsqueeze(0)
+            audio = torchaudio.transforms.Resample(sr, 24000)(audio)
+            cond_mel = MelSpectrogramFeatures()(audio).to(self.device)
+
+            max_mel_tokens = 300
+            cond_mel = cond_mel[..., :max_mel_tokens]  # 截断多余部分
+            if cond_mel.shape[-1] < max_mel_tokens:
+                pad_len = max_mel_tokens - cond_mel.shape[-1]
+                cond_mel = F.pad(cond_mel, (0, pad_len), value=0.0)  # 用0填充
+
+            cond_mel = cond_mel.cpu().numpy()
+
+            cond_mel_frame = cond_mel.shape[-1]
+            if verbose:
+                print(f"cond_mel shape: {cond_mel.shape}", "dtype:", cond_mel.dtype)
+
+            self.cache_audio_prompt = audio_prompt
+            self.cache_cond_mel = cond_mel
+        else:
+            cond_mel = self.cache_cond_mel
+            cond_mel_frame = cond_mel.shape[-1]
+            pass
+
+        cond_mel_ptr = ctypes.c_void_p(cond_mel.ctypes.data)
+        text_tokens_list = self.tokenizer.tokenize(text)
+        sentences = self.tokenizer.split_sentences(
+            text_tokens_list, max_text_tokens_per_sentence
+        )
+        if verbose:
+            print("text token count:", len(text_tokens_list))
+            print("sentences count:", len(sentences))
+            print("max_text_tokens_per_sentence:", max_text_tokens_per_sentence)
+            print(*sentences, sep="\n")
+
+        sampling_rate = 24000
+
+        wavs = []
+        gpt_gen_time = 0
+        gpt_forward_time = 0
+        bigvgan_time = 0
+
+        for sent in sentences:
+            text_tokens = self.tokenizer.convert_tokens_to_ids(sent)
+            text_tokens = torch.tensor(
+                text_tokens, dtype=torch.int32, device=self.device
+            ).unsqueeze(0)
+
+            if verbose:
+                print(text_tokens)
+                print(
+                    f"text_tokens shape: {text_tokens.shape}, text_tokens type: {text_tokens.dtype}"
+                )
+
+            m_start_time = time.perf_counter()
+
+            codes = self.inference_speech(cond_mel_ptr, text_tokens)
+            gpt_gen_time += time.perf_counter() - m_start_time
+
+            code_lens = torch.tensor(
+                [codes.shape[-1]], device=codes.device, dtype=codes.dtype
+            )
+            if verbose:
+                print(codes, type(codes))
+                print(f"codes shape: {codes.shape}, codes type: {codes.dtype}")
+                print(f"code len: {code_lens}")
+
+            codes, code_lens = self.remove_long_silence(
+                codes, silent_token=52, max_consecutive=30
+            )
+            if verbose:
+                print(codes, type(codes))
+                print(f"fix codes shape: {codes.shape}, codes type: {codes.dtype}")
+                print(f"code len: {code_lens}")
+            m_start_time = time.perf_counter()
+            latent = self.gpt(
+                cond_mel_ptr,
+                text_tokens,
+                text_tokens.shape[-1]],
+                codes,
+                code_lens * self.mel_length_compression,
+                cond_mel_lengths=torch.tensor(
+                    [auto_conditioning.shape[-1]], device=text_tokens.device
+                )
+            )
+            gpt_forward_time += time.perf_counter() - m_start_time
+
+            m_start_time = time.perf_counter()
+            wav = self.bigvgan(latent, np.transpose(auto_conditioning, (0, 2, 1)))
+            bigvgan_time += time.perf_counter() - m_start_time
+            wav = wav[0]
+
+            wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+            if verbose:
+                print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+            wavs.append(wav.cpu())  # to cpu before saving
+        end_time = time.perf_counter()
+        wav = torch.cat(wavs, dim=1)
+        wav_length = wav.shape[-1] / sampling_rate
+        print(
+            f">> Reference audio length: {cond_mel_frame * 256 / sampling_rate:.2f} seconds"
+        )
+        print(f">> gpt_gen_time: {gpt_gen_time:.2f} seconds")
+        print(f">> gpt_forward_time: {gpt_forward_time:.2f} seconds")
+        print(f">> bigvgan_time: {bigvgan_time:.2f} seconds")
+        print(f">> Total inference time: {end_time - start_time:.2f} seconds")
+        print(f">> Generated audio length: {wav_length:.2f} seconds")
+        print(f">> RTF: {(end_time - start_time) / wav_length:.4f}")
+
+        # save audio
+        wav = wav.cpu()  # to cpu
+        if output_path:
+            # 直接保存音频到指定路径中
+            if os.path.isfile(output_path):
+                os.remove(output_path)
+                print(">> remove old wav file:", output_path)
+            if os.path.dirname(output_path) != "":
+                os.makedirs(os.path.dirname(output_path), exist_ok=True)
+            torchaudio.save(output_path, wav.type(torch.int16), sampling_rate)
+            print(">> wav file saved to:", output_path)
+            return output_path
+        else:
+            # 返回以符合Gradio的格式要求
+            wav_data = wav.type(torch.int16)
+            wav_data = wav_data.numpy().T
+            return (sampling_rate, wav_data)
+
+
+if __name__ == "__main__":
+    prompt_wav = "test_data/input.wav"
+    text = "There is a vehicle arriving in dock number 7?"
+
+    tts = IndexTTS(
+        cfg_path="checkpoints/config.yaml",
+        model_dir="checkpoints",
+        is_fp16=False,
+        use_cuda_kernel=False,
+    )
+    tts.infer(audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)
