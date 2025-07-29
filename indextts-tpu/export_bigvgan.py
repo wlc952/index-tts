@@ -607,7 +607,7 @@ def export_npu_compatible_onnx():
     
     # 准备测试数据
     print("3. 准备测试数据...")
-    latent = torch.randn(1, 256, 1280)
+    latent = torch.randn(1, 224, 1280)
     # 限制输入范围
     latent = torch.clamp(latent, -3.0, 3.0)
     speaker_embedding = torch.randn(1, 512, 1)
@@ -733,7 +733,7 @@ def export_ultimate_onnx():
     
     # 2. 准备测试数据
     print("2. 准备测试数据...")
-    latent = torch.randn(1, 256, 1280)
+    latent = torch.randn(1, 224, 1280)
     mel_ref = torch.randn(1, 300, 100)
     
     # 3. 获取原始输出作为参考
@@ -929,7 +929,7 @@ if __name__ == "__main__":
     if success:
         print("\n✅ 标准ONNX模型导出成功！")
         
-    # print("\n🔄 开始导出NPU兼容ONNX模型...")
-    # npu_success = export_npu_compatible_onnx()
-    # if npu_success:
-    #     print("\n✅ NPU兼容ONNX模型导出成功！")
+    print("\n🔄 开始导出NPU兼容ONNX模型...")
+    npu_success = export_npu_compatible_onnx()
+    if npu_success:
+        print("\n✅ NPU兼容ONNX模型导出成功！")

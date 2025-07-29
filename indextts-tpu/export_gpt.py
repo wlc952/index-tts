@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 import warnings
 
-os.environ["CUDA_VISIBLE_DEVICES"] = ""
+os.environ["CUDA_VISIBLE_DEVICES"] = "1"
 warnings.filterwarnings("ignore", category=FutureWarning)
 warnings.filterwarnings("ignore", category=UserWarning)
 
@@ -462,10 +462,10 @@ def convert_block_cache(layer_id):
     hidden_states = torch.randn((1, 1, HIDDEN_SIZE)).to(dtype).to(device)
     attention_mask = torch.ones((1, 1, 1, SEQ_LENGTH+1)).to(dtype).to(device)
     past_k = (
-        torch.randn((1, NUM_ATTENTION_HEADS, SEQ_LENGTH, HEAD_DIM)).to(dtype).to(device)
+        torch.randn((1, SEQ_LENGTH, NUM_ATTENTION_HEADS, HEAD_DIM)).to(dtype).to(device)
     )
     past_v = (
-        torch.randn((1, NUM_ATTENTION_HEADS, SEQ_LENGTH, HEAD_DIM)).to(dtype).to(device)
+        torch.randn((1, SEQ_LENGTH, NUM_ATTENTION_HEADS, HEAD_DIM)).to(dtype).to(device)
     )
 
     torch.onnx.export(
@@ -498,6 +498,18 @@ def convert_ln_f():
         model,
         hidden_states,
         f"{folder}/ln_f.onnx",
+        verbose=False,
+        input_names=["input_states"],
+        output_names=["hidden_states"],
+        do_constant_folding=True,
+        opset_version=15,
+    )
+    hidden_states2 = torch.randn((1, 224, HIDDEN_SIZE)).to(dtype).to(device)
+
+    torch.onnx.export(
+        model,
+        hidden_states2,
+        f"{folder}/ln_f2.onnx",
         verbose=False,
         input_names=["input_states"],
         output_names=["hidden_states"],
@@ -665,14 +677,14 @@ def convert_final_norm():
     )
 
 
-
+main
 for i in range(NUM_BLOCKS):
     convert_block(i)
     convert_block_cache(i)
 
 convert_ln_f()
 convert_inference_model_embedding()
-convert_inference_model_lm_head()
+convert_lm_head()
 convert_greedy_head_text()
 
 convert_conds_encoder()

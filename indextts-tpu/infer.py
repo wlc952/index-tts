@@ -21,14 +21,11 @@ from untool import (
     fill_api_info,
     run_model,
     free_model,
-    find_net_num,
     untensor_create,
     untensor_destroy,
     untensor_sync,
     untensor_s2d_bytes,
-    untensor_d2d_bytes_offset,
-    untensor_malloc_device,
-    untensor_free_device,
+    untensor_d2d_bytes_offset
 )
 
 from indextts.utils.feature_extractors import MelSpectrogramFeatures
@@ -48,14 +45,10 @@ class IndexTTS:
         device_id: int = 0,
     ):
         self.device = "cpu"
-        self.is_fp16 = False
-        self.use_cuda_kernel = False
         self.device_id = device_id
 
         self.cfg = OmegaConf.load(cfg_path)
         self.model_dir = model_dir
-        self.stop_mel_token = self.cfg.gpt.stop_mel_token
-
         self.bpe_path = os.path.join(self.model_dir, self.cfg.dataset["bpe_model"])
         self.normalizer = TextNormalizer()
         self.normalizer.load()
@@ -88,9 +81,10 @@ class IndexTTS:
         self.untensor_destroy = untensor_destroy
 
     def _init_idx(self):
-        self.bigvgan_idx = 57
-        self.speaker_encoder_idx = 56
-        self.final_norm = 55
+        self.bigvgan_idx = 58
+        self.speaker_encoder_idx = 57
+        self.final_norm_idx = 56
+        self.ln_f2_idx = 55
         self.ln_f_idx = 54
         self.greedy_head_idx = 53
         self.lm_head_idx = 52
@@ -189,9 +183,11 @@ class IndexTTS:
         self.run(self.bigvgan_idx)
 
         untensor_sync(out_tensor_0, False, True)
-        audio = ctypes.cast(
-            out_tensor_0.contents.data, ctypes.POINTER(ctypes.c_float)
-        ).contents.value
+        shape = tuple(out_tensor_0.contents.shape[:out_tensor_0.contents.dims])
+        size = out_tensor_0.contents.size // 4  # f32
+        buf_type = ctypes.c_float * size
+        buf = ctypes.cast(out_tensor_0.contents.data, ctypes.POINTER(buf_type)).contents
+        audio = np.frombuffer(buf, dtype=np.float32).reshape(shape)
         return audio
 
     def build_aligned_inputs_and_targets(self, input, start_token, stop_token):
@@ -226,12 +222,10 @@ class IndexTTS:
             if actual_end < text_input_tokens.shape[-1]:
                 text_input_tokens[b, actual_end:] = self.stop_text_token
         return text_input_tokens
-
-    def gpt(self, cond_mel_ptr, text_inputs, text_lengths, mel_codes, wav_lengths,
-                cond_mel_lengths):
-
+    
+    def gpt(self, cond_mel_ptr, text_inputs, text_lengths, mel_codes, wav_lengths):
         in_tensor = self.input_tensors[self.conds_encoder_idx][0]
-        conds = self.output_tensors[self.conds_encoder_idx][0]
+        conds = self.output_tensors[self.conds_encoder_idx][0] # [1, 32, 1280]
         self.s2d_bytes(in_tensor, cond_mel_ptr, in_tensor.contents.size)
         self.run(self.conds_encoder_idx)
 
@@ -241,15 +235,63 @@ class IndexTTS:
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         mel_codes = F.pad(mel_codes, (0, 1), value=self.stop_mel_token)
 
+        text_inputs, text_targets = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
+        self.L1 = text_inputs.size(1)
+        text_inputs = F.pad(
+            text_inputs, (0, 256 - text_inputs.size(1)), value=self.stop_text_token
+        )
+        text_inputs = text_inputs.cpu().numpy()
+        text_inputs_ptr = ctypes.c_void_p(text_inputs.ctypes.data)
 
-
-
-
-
+        in_tensor = self.input_tensors[self.text_embedding_idx][0]
+        self.s2d_bytes(in_tensor, text_inputs_ptr, in_tensor.contents.size)
+        self.run(self.text_embedding_idx)
+        text_emb = self.output_tensors[self.text_embedding_idx][0] # [1, L1, 1280]
         
+        mel_codes, mel_targets = self.build_aligned_inputs_and_targets(mel_codes, self.start_mel_token, self.stop_mel_token)
+        self.L2 = mel_codes.size(1)
+        mel_codes = F.pad(
+            mel_codes, (0, 256 - mel_codes.size(1)), value=self.stop_mel_token
+        )
+        mel_codes = mel_codes.cpu().numpy()
+        mel_codes_ptr = ctypes.c_void_p(mel_codes.ctypes.data)
+        in_tensor = self.input_tensors[self.mel_embedding_idx][0]
+        self.s2d_bytes(in_tensor, mel_codes_ptr, in_tensor.contents.size)
+        self.run(self.mel_embedding_idx)
+        mel_emb = self.output_tensors[self.mel_embedding_idx][0] # [1, L2, 1280]
 
+        in_tensor = self.input_tensors[self.block_ids[0]][0]
+        bytes_size = conds.contents.size // 32
+        self.d2d_bytes_offset(in_tensor, conds, 0, 0, conds.contents.size)
+        self.d2d_bytes_offset(
+            in_tensor, text_emb, conds.contents.size, 0, bytes_size * self.L1
+        )1
+        self.d2d_bytes_offset(
+            in_tensor, mel_emb, bytes_size*(32+self.L1), 0, bytes_size*(256-32-self.L1)
+        )
 
+        self.token_length = 32 + self.L1 + self.L2
+        self._gpt_forword_first(gpt=True)
 
+        out_tensor = self.output_tensors[self.ln_f2_idx][0]
+        in_tensor = self.input_tensors[self.final_norm_idx][0]
+        self.d2d_bytes_offset(in_tensor, out_tensor, 0, 0, in_tensor.contents.size)
+        self.run(self.final_norm_idx)
+
+        out_tensor = self.output_tensors[self.final_norm_idx][0] # [1, L1 : L1 + L2 - 2, 1280]
+        untensor_sync(out_tensor, False, True)
+        # to np_array
+        # shape = (tuple(out_tensor.contents.shape[:out_tensor.contents.dims]))
+        shape = (1, 224, 1280)
+        size = out_tensor.contents.size // 4  # float32
+        buf_type = ctypes.c_float * size
+        buf = ctypes.cast(out_tensor.contents.data, ctypes.POINTER(buf_type)).contents
+        latent = np.frombuffer(buf, dtype=np.float32).reshape(shape)
+        print(latent.shape, latent.dtype)
+        latent = latent[:, self.L1 : self.L1  + self.L2 - 2, :]
+        print(latent.shape, latent.dtype)
+        self.ori_latent_len = latent.shape[1]
+        latent = np.pad(latent, ((0, 0), (0, 224 - latent.shape[1]), (0, 0)), mode='constant', constant_values=0)
         return latent
 
     def inference_speech(self, speech_conditioning_mel, text_inputs):
@@ -264,31 +306,32 @@ class IndexTTS:
         )
         self.run(self.conds_encoder_idx)
 
-        L = text_inputs.shape[1]
-        self.text_length = L
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs, _ = self.build_aligned_inputs_and_targets(
             text_inputs, self.start_text_token, self.stop_text_token
         )
+
+        self.L1 = text_inputs.size(1)
         text_inputs = F.pad(
             text_inputs, (0, 256 - text_inputs.size(1)), value=self.stop_text_token
         )
         text_inputs = text_inputs.cpu().numpy()
         text_inputs_ptr = ctypes.c_void_p(text_inputs.ctypes.data)
 
-        text_emb_in = self.input_tensors[self.text_embedding_idx][0]
-        self.s2d_bytes(text_emb_in, text_inputs_ptr, text_inputs.nbytes)
+        in_tensor = self.input_tensors[self.text_embedding_idx][0]
+        self.s2d_bytes(in_tensor, text_inputs_ptr, text_inputs.nbytes)
         self.run(self.text_embedding_idx)
         codes = self._inference_speech_generate()
         return torch.tensor(codes)
 
     def _inference_speech_generate(self):
-        self.token_length = self.text_length
+        self.token_length = 32 + self.L1
         token = self.start_mel_token
 
         first = True
         codes = []
         while self.token_length < self.SEQLEN and token != self.stop_mel_token:
+            self.token_length += 1
             input_ids = np.array([token], dtype=np.int32)
             input_ids_ptr = ctypes.c_void_p(input_ids.ctypes.data)
             in_tensor = self.input_tensors[self.inference_model_embedding_idx][0]
@@ -335,19 +378,18 @@ class IndexTTS:
                 out_tensor.contents.data, ctypes.POINTER(ctypes.c_int32)
             ).contents.value
             codes.append(token)
-            self.token_length += 1
 
         return codes
 
-    def _gpt_forword_first(self):
+    def _gpt_forword_first(self, gpt=False):
         attn_mask_ptr = self.get_first_mask_ptr(self.SEQLEN, self.token_length)
-        out_tensor = self.output_tensors[self.block_ids[0]][0]
+        
         conds = self.output_tensors[self.conds_encoder_idx][0]  # [1, 32, 1280]
-        text_emb = self.output_tensors[self.text_embedding_idx][0]  # token_length
-        text_emb2 = self.output_tensors[self.inference_model_embedding_idx][0]
+        text_emb = self.output_tensors[self.text_embedding_idx][0]  # [1, L1, 1280]
+        text_emb2 = self.output_tensors[self.inference_model_embedding_idx][0] # [1, x, 1280]
         bytes_size = conds.contents.size // 32
-        delta = self.SEQLEN - self.token_length - 32
-
+        
+        out_tensor = self.output_tensors[self.block_ids[0]][0]
         for i in range(self.num_blocks):
             id = self.block_ids[i]
             in_tensor_0 = self.input_tensors[id][0]
@@ -360,14 +402,14 @@ class IndexTTS:
                     text_emb,
                     conds.contents.size,
                     0,
-                    bytes_size * self.token_length,
+                    bytes_size * self.L1,
                 )
                 self.d2d_bytes_offset(
                     in_tensor_0,
                     text_emb2,
-                    bytes_size * (self.token_length + 32),
+                    bytes_size * (self.L1 + 32),
                     0,
-                    bytes_size * delta,
+                    bytes_size * (self.SEQLEN - self.L1 - 32),
                 )
                 self.s2d_bytes(in_tensor_1, attn_mask_ptr, 2 * self.SEQLEN)
             else:
@@ -395,10 +437,16 @@ class IndexTTS:
             )
 
         # ln_f
-        in_tensor = self.input_tensors[self.ln_f_idx][0]
-        src_offset = bytes_size * (self.token_length - 1)
-        self.d2d_bytes_offset(in_tensor, out_tensor, 0, src_offset, bytes_size)
-        self.run(self.ln_f_idx)
+        if gpt:
+            in_tensor = self.input_tensors[self.ln_f2_idx][0]
+            src_offset = bytes_size * 32
+            self.d2d_bytes_offset(in_tensor, out_tensor, 0, src_offset, bytes_size * 224)
+            self.run(self.ln_f2_idx)
+        else:
+            in_tensor = self.input_tensors[self.ln_f_idx][0]
+            src_offset = bytes_size * (self.token_length - 1)
+            self.d2d_bytes_offset(in_tensor, out_tensor, 0, src_offset, bytes_size)
+            self.run(self.ln_f_idx)
 
     def _gpt_forward_next(self):
         attn_mask_ptr = self.get_next_mask_ptr(self.SEQLEN, self.token_length)
@@ -715,19 +763,18 @@ class IndexTTS:
             latent = self.gpt(
                 cond_mel_ptr,
                 text_tokens,
-                text_tokens.shape[-1]],
+                text_tokens.shape[-1],
                 codes,
-                code_lens * self.mel_length_compression,
-                cond_mel_lengths=torch.tensor(
-                    [auto_conditioning.shape[-1]], device=text_tokens.device
-                )
+                code_lens * self.mel_length_compression
             )
             gpt_forward_time += time.perf_counter() - m_start_time
 
             m_start_time = time.perf_counter()
-            wav = self.bigvgan(latent, np.transpose(auto_conditioning, (0, 2, 1)))
+            wav = self.bigvgan(latent, np.transpose(cond_mel, (0, 2, 1)))
             bigvgan_time += time.perf_counter() - m_start_time
             wav = wav[0]
+            original_wav_length = int(wav.shape[-1] * self.ori_latent_len / 224)
+            wav = wav[:, :original_wav_length]
 
             wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
             if verbose:
@@ -771,8 +818,6 @@ if __name__ == "__main__":
 
     tts = IndexTTS(
         cfg_path="checkpoints/config.yaml",
-        model_dir="checkpoints",
-        is_fp16=False,
-        use_cuda_kernel=False,
+        model_dir="checkpoints"
     )
     tts.infer(audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)
