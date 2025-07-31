@@ -6,7 +6,7 @@ __pycache__
 .vscode/
 checkpoints/*.pth
 checkpoints/*.vocab
-# checkpoints/*.model
+checkpoints/*.model
 checkpoints/.cache
 outputs/
 build/
