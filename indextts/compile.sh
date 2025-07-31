@@ -68,8 +68,8 @@ process_block()
 }
 
 # Process each block
-for ((i=0; i<$num_layers; i++)); do
-    process_block $i
+for ((i=0; i<$num_blocks; i++)); do
+    process_block $i 
     models="${models}${outdir}/block_${i}.bmodel ${outdir}/block_cache_${i}.bmodel "
 done
 
@@ -180,6 +180,19 @@ model_deploy.py \
     --model ln_f.bmodel
 
 model_transform.py \
+    --model_name ln_f2 \
+    --model_def ${onnx_dir}/ln_f2.onnx \
+    --mlir ln_f2.mlir
+
+model_deploy.py \
+    --mlir ln_f2.mlir \
+    $quantize_args \
+    --quant_input \
+    --quant_output \
+    --chip ${chip} \
+    --model ln_f2.bmodel
+
+model_transform.py \
     --model_name final_norm \
     --model_def ${onnx_dir}/final_norm.onnx \
     --mlir final_norm.mlir
@@ -192,7 +205,7 @@ model_deploy.py \
     --model final_norm.bmodel
 
 
-models=${models}${outdir}'/lm_head.bmodel '${outdir}'/greedy_head.bmodel '${outdir}'/ln_f.bmodel '${outdir}'/final_norm.bmodel '
+models=${models}${outdir}'/lm_head.bmodel '${outdir}'/greedy_head.bmodel '${outdir}'/ln_f.bmodel '${outdir}'/ln_f2.bmodel '${outdir}'/final_norm.bmodel '
 popd
 echo $models
 
