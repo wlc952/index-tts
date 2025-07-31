@@ -4,7 +4,7 @@ import traceback
 import re
 from typing import List, Union, overload
 import warnings
-from indextts.utils.common import tokenize_by_CJK_char, de_tokenized_by_CJK_char
+from utils.common import tokenize_by_CJK_char, de_tokenized_by_CJK_char
 from sentencepiece import SentencePieceProcessor
 
 
@@ -88,10 +88,10 @@ class TextNormalizer:
     def load(self):
         # print(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
         # sys.path.append(model_dir)
-        import platform
+        # import platform
         if self.zh_normalizer is not None and self.en_normalizer is not None:
             return
-        if platform.system() == "Darwin":
+        if True:
             from wetext import Normalizer
 
             self.zh_normalizer = Normalizer(remove_erhua=False, lang="zh", operator="tn")

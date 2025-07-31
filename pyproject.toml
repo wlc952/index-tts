@@ -5,9 +5,14 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "einops==0.8.1",
     "omegaconf>=2.3.0",
+    "sentencepiece>=0.2.0",
+    "tokenizers==0.15.0",
     "torchaudio>=2.7.1",
-    "untool>=0.2.1",
+    "transformers==4.36.2",
+    "untool==0.2.2",
+    "wetext>=0.0.8",
 ]
 
 [[tool.uv.index]]
