@@ -581,6 +581,7 @@ def convert_greedy_head_text():
         opset_version=15,
     )
 
+
 def convert_conds_encoder():
     class conds_encoder(torch.nn.Module):
         def __init__(self):
@@ -592,22 +593,22 @@ def convert_conds_encoder():
                 dtype=torch.bool,
                 device=model1.device,
             )
-            self.cond_mel_lengths = torch.tensor([300], device=model1.device)
 
-        def forward(self, speech_conditioning_input):
-            speech_conditioning_input, _ = self.conditioning_encoder(speech_conditioning_input,  self.cond_mel_lengths) # type: ignore
-            conds = self.perceiver_encoder(speech_conditioning_input, self.conds_mask) # type: ignore
+        def forward(self, speech_conditioning_input, cond_mel_lengths):
+            speech_conditioning, _ = self.conditioning_encoder(speech_conditioning_input,  cond_mel_lengths) # type: ignore
+            conds = self.perceiver_encoder(speech_conditioning, self.conds_mask)
             return conds
 
     model = conds_encoder()
     speech_conditioning_input = torch.randn((1, 300, 100)).to(dtype).to(device)
+    cond_mel_lengths = torch.tensor([300], device=model1.device)
 
     torch.onnx.export(
         model,
-        speech_conditioning_input,
+        (speech_conditioning_input, cond_mel_lengths),
         f"{folder}/conds_encoder.onnx",
         verbose=False,
-        input_names=["speech_conditioning_input"],
+        input_names=["speech_conditioning", "cond_mel_lengths"],
         output_names=["conds"],
         do_constant_folding=True,
         opset_version=15,
@@ -677,17 +678,16 @@ def convert_final_norm():
     )
 
 
-main
-for i in range(NUM_BLOCKS):
-    convert_block(i)
-    convert_block_cache(i)
+# for i in range(NUM_BLOCKS):
+#     convert_block(i)
+#     convert_block_cache(i)
 
-convert_ln_f()
-convert_inference_model_embedding()
-convert_lm_head()
-convert_greedy_head_text()
+# convert_ln_f()
+# convert_inference_model_embedding()
+# convert_lm_head()
+# convert_greedy_head_text()
 
 convert_conds_encoder()
-convert_embedding()
-convert_final_norm()
+# convert_embedding()
+# convert_final_norm()
 

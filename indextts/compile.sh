@@ -115,6 +115,7 @@ model_deploy.py \
     --quantize BF16 \
     --quant_output \
     --chip ${chip} \
+    --addr_mode io_alone \
     --model text_embedding.bmodel
 
 model_transform.py \
@@ -127,6 +128,7 @@ model_deploy.py \
     --quantize BF16 \
     --quant_output \
     --chip ${chip} \
+    --addr_mode io_alone \
     --model conds_encoder.bmodel
 
 models=$models' '$outdir'/inference_model_embedding.bmodel '$outdir'/mel_embedding.bmodel '$outdir'/text_embedding.bmodel '${outdir}'/conds_encoder.bmodel '
@@ -141,7 +143,7 @@ pushd $outdir
 
 model_transform.py \
     --model_name lm_head \
-    --model_def ${onnx_dir}/inference_model_lm_head.onnx \
+    --model_def ${onnx_dir}/lm_head.onnx \
     --mlir lm_head.mlir
 
 model_deploy.py \
@@ -208,6 +210,7 @@ model_deploy.py \
     --mlir speaker_encoder.mlir \
     --quantize BF16 \
     --chip ${chip} \
+    --addr_mode io_alone \
     --model speaker_encoder.bmodel
 
 model_transform.py \

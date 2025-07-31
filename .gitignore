@@ -15,3 +15,8 @@ build/
 .venv
 *.bmodel
 *.tar.gz
+onnx
+gen.wav
+test.py
+*.npz
+tmp

@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from einops import rearrange, repeat
 from einops.layers.torch import Rearrange
 from packaging import version
-from torch import einsum, nn
+from torch import nn
 
 
 def exists(val):
@@ -43,6 +43,7 @@ class Attend(nn.Module):
         self.register_buffer("mask", None, persistent=False)
 
         self.use_flash = use_flash
+        self.heads = None  # Will be set when used
         assert not (
             use_flash and version.parse(torch.__version__) < version.parse("2.0.0")
         ), "in order to use flash attention, you must be using pytorch 2.0 or above"
@@ -79,10 +80,12 @@ class Attend(nn.Module):
         # kv shape torch.Size([1, 512, 64]) -> torch.Size([1, 8, 512, 64])
 
         if k.ndim == 3:
-            k = rearrange(k, "b ... -> b 1 ...").expand_as(q)
+            # Fixed shape expansion for ONNX compatibility
+            k = k.unsqueeze(1).expand(-1, heads, -1, -1)
 
         if v.ndim == 3:
-            v = rearrange(v, "b ... -> b 1 ...").expand_as(q)
+            # Fixed shape expansion for ONNX compatibility  
+            v = v.unsqueeze(1).expand(-1, heads, -1, -1)
 
         # Check if mask exists and expand to compatible shape
         # The mask is B L, so it would have to be expanded to B H N L
@@ -114,17 +117,23 @@ class Attend(nn.Module):
         """
 
         n, device = q.shape[-2], q.device
+        heads = q.shape[1]  # Get heads from q tensor shape
 
         scale = q.shape[-1] ** -0.5
 
         if self.use_flash:
             return self.flash_attn(q, k, v, mask=mask)
 
-        kv_einsum_eq = "b j d" if k.ndim == 3 else "b h j d"
+        # Use explicit matrix multiplication instead of einsum for ONNX compatibility
+        if k.ndim == 3:
+            # k: [b, j, d] -> [b, 1, j, d] -> [b, h, j, d]
+            k = k.unsqueeze(1).expand(-1, heads, -1, -1)
+        if v.ndim == 3:
+            # v: [b, j, d] -> [b, 1, j, d] -> [b, h, j, d]  
+            v = v.unsqueeze(1).expand(-1, heads, -1, -1)
 
-        # similarity
-
-        sim = einsum(f"b h i d, {kv_einsum_eq} -> b h i j", q, k) * scale
+        # similarity: q @ k.T
+        sim = torch.matmul(q, k.transpose(-2, -1)) * scale
 
         # key padding mask
 
@@ -143,19 +152,14 @@ class Attend(nn.Module):
         attn = sim.softmax(dim=-1)
         attn = self.attn_dropout(attn)
 
-        # aggregate values
-
-        out = einsum(f"b h i j, {kv_einsum_eq} -> b h i d", attn, v)
+        # aggregate values: attn @ v
+        out = torch.matmul(attn, v)
 
         return out
 
 
 def Sequential(*mods):
     return nn.Sequential(*filter(exists, mods))
-
-
-def exists(x):
-    return x is not None
 
 
 def default(val, d):
