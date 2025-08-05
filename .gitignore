@@ -17,3 +17,5 @@ build/
 *.bmodel
 *.tar.gz
 onnx
+*.wav
+*.npz

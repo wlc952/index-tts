@@ -47,7 +47,7 @@ class IndexTTS:
         self.model_dir = model_dir
         self.bpe_path = os.path.join(self.model_dir, "bpe.model")
         self.bmodel_path = os.path.join(
-            self.model_dir, "indextts_bm1684x_f32_seq256.bmodel"
+            self.model_dir, "indextts_bm1684x_f16_seq256.bmodel"
         )
         self.normalizer = TextNormalizer()
         self.normalizer.load()
@@ -560,7 +560,7 @@ class IndexTTS:
         self.run(self.ln_f_idx)
 
     def get_first_mask_ptr(self, seq_len, token_len):
-        self._attn_mask = np.full((seq_len, seq_len), -10000.0, dtype=np.float32)
+        self._attn_mask = np.full((seq_len, seq_len), 0xF0E2, dtype=np.uint16)
         rows = np.arange(token_len).reshape(-1, 1)
         cols = np.arange(seq_len).reshape(1, -1)
         self._attn_mask[:token_len, :] = np.where(
@@ -569,8 +569,8 @@ class IndexTTS:
         return ctypes.c_void_p(self._attn_mask.ctypes.data)
 
     def get_next_mask_ptr(self, seq_len, token_len):
-        self._attn_mask = np.zeros(seq_len + 1, dtype=np.float32)
-        self._attn_mask[token_len - 1 : seq_len] = -10000.0
+        self._attn_mask = np.zeros(seq_len + 1, dtype=np.uint16)
+        self._attn_mask[token_len - 1 : seq_len] = 0xF0E2
         return ctypes.c_void_p(self._attn_mask.ctypes.data)
 
     def remove_long_silence(self, codes: torch.Tensor, silent_token=52, max_consecutive=30):
