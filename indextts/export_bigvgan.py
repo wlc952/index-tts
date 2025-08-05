@@ -235,370 +235,6 @@ def verify_onnx_model(onnx_path, pytorch_model, test_inputs):
         print(f"   ❌ ONNX验证过程中出错: {str(e)}")
         return False
 
-
-def create_npu_compatible_model():
-    """创建NPU兼容的模型，解决浮点异常问题"""
-    print("=== 创建NPU兼容的BigVGAN模型 ===")
-    
-    # 1. 加载原始模型
-    print("1. 加载原始模型...")
-    cfg = OmegaConf.load("checkpoints/config.yaml")
-    
-    model = Generator(cfg.bigvgan, use_cuda_kernel=False)
-    checkpoint = torch.load("checkpoints/bigvgan_generator.pth", map_location="cpu")
-    model.load_state_dict(checkpoint["generator"])
-    model.eval()
-    model.remove_weight_norm()
-    
-    # 2. 替换所有不兼容的模块
-    print("2. 替换NPU不兼容的模块...")
-    
-    # 定义通道数映射
-    channels_map = {
-        0: 768, 1: 768, 2: 768,
-        3: 384, 4: 384, 5: 384,
-        6: 192, 7: 192, 8: 192,
-        9: 96, 10: 96, 11: 96,
-        12: 48, 13: 48, 14: 48,
-        15: 24, 16: 24, 17: 24,
-        'post': 24
-    }
-    
-    def replace_for_npu(module, module_path=""):
-        for name, child in module.named_children():
-            current_path = f"{module_path}.{name}" if module_path else name
-            
-            if isinstance(child, activations.SnakeBeta):
-                setattr(module, name, NPUSnakeBeta(child))
-                print(f"   替换了 SnakeBeta: {current_path}")
-            elif hasattr(child, '__class__') and 'Activation1d' in child.__class__.__name__:
-                # 确定通道数
-                channels = 768  # 默认值
-                if 'resblocks' in current_path:
-                    parts = current_path.split('.')
-                    for i, part in enumerate(parts):
-                        if part == 'resblocks' and i + 1 < len(parts):
-                            try:
-                                idx = int(parts[i + 1])
-                                channels = channels_map.get(idx, 768)
-                                break
-                            except (ValueError, IndexError):
-                                pass
-                elif 'activation_post' in current_path:
-                    channels = channels_map['post']
-                
-                # 替换为NPU兼容版本
-                npu_activation = NPUActivation1d(child, channels)
-                if isinstance(npu_activation.act, activations.SnakeBeta):
-                    npu_activation.act = NPUSnakeBeta(npu_activation.act)
-                setattr(module, name, npu_activation)
-                print(f"   替换了 Activation1d: {current_path} (通道数: {channels})")
-            else:
-                replace_for_npu(child, current_path)
-    
-    replace_for_npu(model)
-    return model
-
-
-class NPUSnakeBeta(nn.Module):
-    """NPU兼容的SnakeBeta，极度保守的数值稳定性"""
-    
-    def __init__(self, original_snakebeta):
-        super().__init__()
-        self.in_features = original_snakebeta.in_features
-        self.alpha_logscale = original_snakebeta.alpha_logscale
-        self.no_div_by_zero = original_snakebeta.no_div_by_zero
-        
-        # 限制参数范围，防止极值
-        alpha_data = torch.clamp(original_snakebeta.alpha.data.clone(), -5.0, 5.0)
-        beta_data = torch.clamp(original_snakebeta.beta.data.clone(), -5.0, 5.0)
-        
-        self.alpha = nn.Parameter(alpha_data)
-        self.beta = nn.Parameter(beta_data)
-        
-        # 极严格的数值稳定性参数
-        self.eps = 1e-6
-        self.max_val = 5.0  # 更严格的范围限制
-        self.min_val = -5.0
-        self.sin_scale = 0.1  # 减小sin函数的影响
-    
-    def forward(self, x):
-        # 极严格的输入裁剪
-        x = torch.clamp(x, self.min_val, self.max_val)
-        
-        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
-        beta = self.beta.unsqueeze(0).unsqueeze(-1)
-        
-        # 严格限制参数范围
-        alpha = torch.clamp(alpha, -3.0, 3.0)
-        beta = torch.clamp(beta, -3.0, 3.0)
-        
-        if self.alpha_logscale:
-            # 更严格的指数范围限制
-            alpha = torch.clamp(alpha, -5, 5)
-            beta = torch.clamp(beta, -5, 5)
-            alpha = torch.exp(alpha)
-            beta = torch.exp(beta)
-        
-        # 确保beta不会太小或太大
-        beta = torch.clamp(beta, 0.1, 10.0) + self.eps
-        alpha = torch.clamp(alpha, 0.01, 5.0)
-        
-        # 限制sin输入，使用更小的scale
-        sin_input = torch.clamp(x * alpha * self.sin_scale, -10, 10)
-        
-        # 使用更稳定的sin计算
-        sin_val = torch.sin(sin_input)
-        sin_squared = sin_val * sin_val  # 避免pow操作
-        
-        # 限制除法结果
-        div_result = torch.clamp(1.0 / beta, 0.01, 100.0)
-        
-        # 计算结果并严格限制范围
-        result = x + div_result * sin_squared * 0.1  # 进一步减小激活强度
-        result = torch.clamp(result, self.min_val, self.max_val)
-        
-        return result
-
-
-class NPULowPassFilter1d(nn.Module):
-    """NPU兼容的静态LowPassFilter1d，极度保守的数值稳定性，精确控制输出尺寸"""
-    
-    def __init__(self, original_filter, channels):
-        super().__init__()
-        self.stride = max(1, original_filter.stride)  # 确保stride >= 1
-        self.pad_left = max(0, original_filter.pad_left)
-        self.pad_right = max(0, original_filter.pad_right)
-        self.padding_mode = 'constant'
-        self.channels = channels
-        
-        # 创建极保守的滤波器权重
-        filter_weight = original_filter.filter.data.clone()
-        
-        # 权重归一化和稳定化
-        weight_sum = torch.sum(torch.abs(filter_weight)) + 1e-8
-        filter_weight = filter_weight / weight_sum
-        filter_weight = torch.clamp(filter_weight, -0.1, 0.1)  # 严格限制权重范围
-        
-        # 确保权重和为1（归一化）
-        filter_weight = filter_weight / (torch.sum(filter_weight) + 1e-8)
-        
-        expanded_weight = filter_weight.expand(channels, -1, -1)
-        
-        self.conv = nn.Conv1d(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=filter_weight.shape[-1],
-            stride=self.stride,
-            groups=channels,
-            bias=False,
-            padding=0  # 手动处理padding
-        )
-        
-        with torch.no_grad():
-            self.conv.weight.copy_(expanded_weight)
-            # 进一步限制权重
-            self.conv.weight.clamp_(-0.05, 0.05)
-    
-    def forward(self, x):
-        # 记录输入长度，用于计算期望输出长度
-        input_length = x.shape[-1]
-        expected_output_length = input_length // self.stride
-        
-        # 极严格的输入范围限制
-        x = torch.clamp(x, -3.0, 3.0)
-        
-        # 手动padding，使用更小的pad值
-        actual_pad_left = min(self.pad_left, 10)
-        actual_pad_right = min(self.pad_right, 10)
-        
-        if actual_pad_left > 0 or actual_pad_right > 0:
-            x = F.pad(x, (actual_pad_left, actual_pad_right), mode='constant', value=0.0)
-        
-        out = self.conv(x)
-        
-        # 确保输出长度符合预期
-        current_length = out.shape[-1]
-        if current_length > expected_output_length:
-            # 如果过长，从中心裁剪
-            excess = current_length - expected_output_length
-            start = excess // 2
-            out = out[..., start:start + expected_output_length]
-        elif current_length < expected_output_length and expected_output_length > 0:
-            # 如果过短，填充
-            deficit = expected_output_length - current_length
-            pad_left = deficit // 2
-            pad_right = deficit - pad_left
-            out = F.pad(out, (pad_left, pad_right), mode='constant', value=0.0)
-        
-        # 极严格的输出范围限制
-        out = torch.clamp(out, -3.0, 3.0)
-        return out
-
-
-class NPUUpSample1d(nn.Module):
-    """NPU兼容的静态UpSample1d，极保守设计，精确控制输出尺寸"""
-    
-    def __init__(self, original_upsample, channels):
-        super().__init__()
-        self.ratio = min(original_upsample.ratio, 4)  # 限制ratio避免过度放大
-        self.stride = max(1, original_upsample.stride)
-        self.pad = max(0, min(original_upsample.pad, 5))  # 限制pad大小
-        self.pad_left = max(0, min(original_upsample.pad_left, 10))
-        self.pad_right = max(0, min(original_upsample.pad_right, 10))
-        self.channels = channels
-        
-        # 极保守的权重处理
-        filter_weight = original_upsample.filter.data.clone()
-        
-        # 权重归一化和限制
-        weight_abs_sum = torch.sum(torch.abs(filter_weight)) + 1e-8
-        filter_weight = filter_weight / weight_abs_sum
-        filter_weight = torch.clamp(filter_weight, -0.05, 0.05)
-        
-        # 再次归一化确保稳定
-        filter_weight = filter_weight / (torch.sum(torch.abs(filter_weight)) + 1e-8)
-        
-        expanded_weight = filter_weight.expand(channels, -1, -1)
-        
-        self.conv_transpose = nn.ConvTranspose1d(
-            in_channels=channels,
-            out_channels=channels,
-            kernel_size=filter_weight.shape[-1],
-            stride=self.stride,
-            groups=channels,
-            bias=False,
-            padding=0  # 手动处理padding
-        )
-        
-        with torch.no_grad():
-            self.conv_transpose.weight.copy_(expanded_weight)
-            # 进一步限制权重
-            self.conv_transpose.weight.clamp_(-0.02, 0.02)
-    
-    def forward(self, x):
-        # 记录输入尺寸，用于计算期望的输出尺寸
-        input_length = x.shape[-1]
-        expected_output_length = input_length * self.ratio
-        
-        # 极严格的输入范围限制
-        x = torch.clamp(x, -2.0, 2.0)
-        
-        # 保守的padding
-        actual_pad = min(self.pad, 3)
-        if actual_pad > 0:
-            x = F.pad(x, (actual_pad, actual_pad), mode='constant', value=0.0)
-        
-        # 限制ratio避免溢出，使用更小的放大倍数
-        safe_ratio = min(self.ratio, 2.0)
-        x = safe_ratio * self.conv_transpose(x)
-        
-        # 精确控制输出尺寸
-        current_length = x.shape[-1]
-        
-        # 如果输出过长，从中心裁剪到期望长度
-        if current_length > expected_output_length:
-            excess = current_length - expected_output_length
-            start = excess // 2
-            x = x[..., start:start + expected_output_length]
-        # 如果输出过短，在两端填充
-        elif current_length < expected_output_length:
-            deficit = expected_output_length - current_length
-            pad_left = deficit // 2
-            pad_right = deficit - pad_left
-            x = F.pad(x, (pad_left, pad_right), mode='constant', value=0.0)
-        
-        # 极严格的输出范围限制
-        x = torch.clamp(x, -2.0, 2.0)
-        return x
-
-
-class NPUDownSample1d(nn.Module):
-    """NPU兼容的静态DownSample1d"""
-    
-    def __init__(self, original_downsample, channels):
-        super().__init__()
-        self.lowpass = NPULowPassFilter1d(original_downsample.lowpass, channels)
-    
-    def forward(self, x):
-        return self.lowpass(x)
-
-
-class NPUActivation1d(nn.Module):
-    """NPU兼容的静态Activation1d，极保守设计，确保维度匹配"""
-    
-    def __init__(self, original_activation, channels):
-        super().__init__()
-        self.act = original_activation.act
-        self.upsample = NPUUpSample1d(original_activation.upsample, channels)
-        self.downsample = NPUDownSample1d(original_activation.downsample, channels)
-        
-        # 添加额外的稳定性参数
-        self.eps = 1e-7
-        self.max_val = 2.0
-        self.min_val = -2.0
-    
-    def _match_dimensions(self, processed, original):
-        """确保处理后的张量与原始张量维度匹配"""
-        if processed.shape != original.shape:
-            # 如果时间维度不匹配，进行调整
-            if len(processed.shape) == 3 and len(original.shape) == 3:
-                if processed.shape[2] > original.shape[2]:
-                    # 裁剪到原始大小
-                    diff = processed.shape[2] - original.shape[2]
-                    start = diff // 2
-                    processed = processed[..., start:start + original.shape[2]]
-                elif processed.shape[2] < original.shape[2]:
-                    # 填充到原始大小
-                    diff = original.shape[2] - processed.shape[2]
-                    pad_left = diff // 2
-                    pad_right = diff - pad_left
-                    processed = F.pad(processed, (pad_left, pad_right), mode='constant', value=0.0)
-        
-        return processed
-    
-    def forward(self, x):
-        # 保存原始形状用于维度匹配
-        original_shape = x.shape
-        
-        # 每步都进行极严格的范围限制
-        x = torch.clamp(x, self.min_val, self.max_val)
-        
-        # 检查是否有异常值
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            x = torch.zeros_like(x)
-        
-        # 保存激活前的值用于残差连接
-        input_for_residual = x.clone()
-        
-        x = self.upsample(x)
-        x = torch.clamp(x, self.min_val, self.max_val)
-        
-        # 再次检查异常值
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            x = torch.zeros_like(x)
-        
-        x = self.act(x)
-        x = torch.clamp(x, self.min_val, self.max_val)
-        
-        # 再次检查异常值
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            x = torch.zeros_like(x)
-        
-        x = self.downsample(x)
-        x = torch.clamp(x, self.min_val, self.max_val)
-        
-        # 确保输出维度与输入匹配
-        x = self._match_dimensions(x, input_for_residual)
-        
-        # 最终检查
-        if torch.isnan(x).any() or torch.isinf(x).any():
-            x = torch.zeros_like(x)
-            
-        return x
-
-
-def export_npu_compatible_onnx():
     """导出NPU兼容的ONNX模型"""
     print("=== BigVGAN NPU兼容 ONNX 导出 ===")
     
@@ -922,14 +558,201 @@ def export_ultimate_onnx():
     return True
 
 
+def export_approximated_filter_onnx():
+    """滤波器近似方案：用静态卷积近似原始滤波器"""
+    print("=== BigVGAN 滤波器近似 ONNX 导出 ===")
+    
+    # 1. 加载模型
+    print("1. 加载原始模型...")
+    cfg = OmegaConf.load("checkpoints/config.yaml")
+    model = Generator(cfg.bigvgan, use_cuda_kernel=False)
+    checkpoint = torch.load("checkpoints/bigvgan_generator.pth", map_location="cpu")
+    model.load_state_dict(checkpoint["generator"])
+    model.eval()
+    model.remove_weight_norm()
+    
+    # 2. 创建静态滤波器近似
+    class StaticFilterActivation1d(nn.Module):
+        def __init__(self, original_activation, expected_channels):
+            super().__init__()
+            
+            # 保持激活函数
+            if isinstance(original_activation.act, activations.SnakeBeta):
+                self.act = MinimalSnakeBeta(original_activation.act)
+            else:
+                self.act = original_activation.act
+            
+            # 创建静态抗混叠滤波器
+            # 使用简单的低通滤波器近似原始的复杂滤波器
+            kernel_size = 5  # 较小的核，NPU友好
+            self.channels = expected_channels
+            
+            # 创建低通滤波器权重（汉宁窗）
+            window = torch.hann_window(kernel_size)
+            window = window / window.sum()
+            
+            # 扩展到所有通道
+            filter_weight = window.view(1, 1, kernel_size).expand(expected_channels, 1, kernel_size)
+            
+            # 创建静态卷积层
+            self.anti_alias_filter = nn.Conv1d(
+                in_channels=expected_channels,
+                out_channels=expected_channels,
+                kernel_size=kernel_size,
+                padding=kernel_size // 2,
+                groups=expected_channels,
+                bias=False
+            )
+            
+            # 设置滤波器权重
+            with torch.no_grad():
+                self.anti_alias_filter.weight.copy_(filter_weight)
+        
+        def forward(self, x):
+            # 如果通道数不匹配，使用简单的激活
+            if x.shape[1] != self.channels:
+                return self.act(x)
+            
+            # 应用激活函数
+            x_activated = self.act(x)
+            
+            # 应用静态抗混叠滤波
+            x_filtered = self.anti_alias_filter(x_activated)
+            
+            # 与原始信号混合，保持大部分激活特性
+            x = x_activated * 0.8 + x_filtered * 0.2
+            
+            return x
+    
+    class MinimalSnakeBeta(nn.Module):
+        def __init__(self, original_snakebeta):
+            super().__init__()
+            self.in_features = original_snakebeta.in_features
+            self.alpha_logscale = original_snakebeta.alpha_logscale
+            self.no_div_by_zero = original_snakebeta.no_div_by_zero
+            self.alpha = nn.Parameter(original_snakebeta.alpha.data.clone())
+            self.beta = nn.Parameter(original_snakebeta.beta.data.clone())
+    
+        def forward(self, x):
+            alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
+            beta = self.beta.unsqueeze(0).unsqueeze(-1)
+            
+            if self.alpha_logscale:
+                alpha = torch.exp(alpha)
+                beta = torch.exp(beta)
+            
+            x = x + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(torch.sin(x * alpha), 2)
+            return x
+    
+    # 3. 替换模块，包括通道数映射
+    print("2. 替换为静态滤波器近似...")
+    
+    # BigVGAN的通道数映射（根据网络结构）
+    channels_map = {
+        'activation_post': 24,  # 最后一层
+        'resblocks.0': 768, 'resblocks.1': 768, 'resblocks.2': 768,
+        'resblocks.3': 384, 'resblocks.4': 384, 'resblocks.5': 384,
+        'resblocks.6': 192, 'resblocks.7': 192, 'resblocks.8': 192,
+        'resblocks.9': 96, 'resblocks.10': 96, 'resblocks.11': 96,
+        'resblocks.12': 48, 'resblocks.13': 48, 'resblocks.14': 48,
+        'resblocks.15': 24, 'resblocks.16': 24, 'resblocks.17': 24,
+    }
+    
+    def get_expected_channels(module_path):
+        """根据模块路径获取期望的通道数"""
+        for key, channels in channels_map.items():
+            if key in module_path:
+                return channels
+        return 512  # 默认值
+    
+    def replace_with_static_filter(module, module_path=""):
+        for name, child in module.named_children():
+            current_path = f"{module_path}.{name}" if module_path else name
+            
+            if isinstance(child, activations.SnakeBeta):
+                setattr(module, name, MinimalSnakeBeta(child))
+                print(f"   替换了 SnakeBeta: {current_path}")
+            elif hasattr(child, '__class__') and 'Activation1d' in child.__class__.__name__:
+                expected_channels = get_expected_channels(current_path)
+                setattr(module, name, StaticFilterActivation1d(child, expected_channels))
+                print(f"   替换了 Activation1d: {current_path} (通道数: {expected_channels})")
+            else:
+                replace_with_static_filter(child, current_path)
+    
+    replace_with_static_filter(model)
+    
+    # 4. 包装器
+    class FilterApproximatedWrapper(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+        
+        def forward(self, x, embedding):
+            x = x.transpose(1, 2)
+            x = self.model.conv_pre(x)
+            x = x + self.model.cond_layer(embedding)
+            
+            for i in range(self.model.num_upsamples):
+                for up_layer in self.model.ups[i]:
+                    x = up_layer(x)
+                
+                x = x + self.model.conds[i](embedding)
+                
+                xs = None
+                for j in range(self.model.num_kernels):
+                    if xs is None:
+                        xs = self.model.resblocks[i * self.model.num_kernels + j](x)
+                    else:
+                        xs += self.model.resblocks[i * self.model.num_kernels + j](x)
+                x = xs / self.model.num_kernels
+            
+            x = self.model.activation_post(x)
+            x = self.model.conv_post(x)
+            x = torch.tanh(x)
+            
+            return x
+    
+    # 5. 准备测试数据
+    print("3. 准备测试数据...")
+    torch.manual_seed(42)
+    latent = torch.randn(1, 224, 1280)
+    speaker_embedding = torch.randn(1, 512, 1)
+    
+    # 6. 导出模型
+    os.makedirs("onnx", exist_ok=True)
+    wrapped_model = FilterApproximatedWrapper(model)
+    
+    print("4. 导出滤波器近似ONNX模型...")
+    torch.onnx.export(
+        wrapped_model,
+        (latent, speaker_embedding),
+        "onnx/bigvgan_filter_approximated.onnx",
+        input_names=["latent", "speaker_embedding"],
+        output_names=["audio"],
+        opset_version=14,
+        do_constant_folding=True,
+        verbose=False,
+        dynamic_axes=None,
+        export_params=True,
+        keep_initializers_as_inputs=False,
+        training=torch.onnx.TrainingMode.EVAL
+    )
+    print("   滤波器近似ONNX模型导出成功！")
+    
+    return True
+
 
 if __name__ == "__main__":
-    print("🔄 开始导出标准ONNX模型...")
-    success = export_ultimate_onnx()
-    if success:
-        print("\n✅ 标准ONNX模型导出成功！")
-        
-    print("\n🔄 开始导出NPU兼容ONNX模型...")
-    npu_success = export_npu_compatible_onnx()
-    if npu_success:
-        print("\n✅ NPU兼容ONNX模型导出成功！")
+    # print("🔄 开始导出标准ONNX模型...")
+    # success = export_ultimate_onnx()
+    # if success:
+    #     print("\n✅ 标准ONNX模型导出成功！")
+    print("\n🔄 方案2: 滤波器近似 - 用静态滤波器近似原始滤波器...")
+    try:
+        filter_success = export_approximated_filter_onnx()
+        if filter_success:
+            print("✅ 滤波器近似导出成功！这是滤波器和NPU兼容性的折中方案")
+        else:
+            print("❌ 滤波器近似导出失败")
+    except Exception as e:
+        print(f"❌ 滤波器近似导出异常: {e}")

@@ -139,9 +139,9 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         mel_len = self.cached_mel_emb.shape[1]
         if input_ids.shape[1] != 1:
             text_inputs = input_ids[:, mel_len:]
-            # breakpoint()
             text_emb = self.embeddings(text_inputs) # [1,1,1280]
             text_emb = text_emb + self.text_pos_embedding(text_emb)
+            print("text_emb_cache: ", text_emb[0, 0, :10])
             if self.cached_mel_emb.shape[0] != text_emb.shape[0]:
                 mel_emb = self.cached_mel_emb.repeat_interleave(
                     text_emb.shape[0] // self.cached_mel_emb.shape[0], 0
@@ -154,6 +154,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             emb = emb + self.text_pos_embedding.get_fixed_embedding(
                 attention_mask.shape[1] - mel_len, attention_mask.device
             )
+
         transformer_outputs = self.transformer(
             inputs_embeds=emb,
             past_key_values=past_key_values,
@@ -170,6 +171,7 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
         )
         hidden_states = transformer_outputs[0]
 
+
         # Set device for model parallelism
         if self.model_parallel:
             if torch.backends.mps.is_available():
@@ -179,7 +181,13 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             hidden_states = hidden_states.to(self.lm_head.weight.device)
 
         lm_logits = self.lm_head(hidden_states) # 1,55,1280; 1,1,1280
+        # print("input_ids：", input_ids)
+        # print("hidden_states: ", hidden_states.shape)
+        # print("hidden_states: ", hidden_states[0, -1, :10])
+        # print("lm_logits: ", lm_logits.shape)
+        # print("lm_logits: ", lm_logits[0, -1, :10])
         # breakpoint()
+
 
         if not return_dict:
             return (lm_logits,) + transformer_outputs[1:]
@@ -246,10 +254,12 @@ class LearnedPositionEmbeddings(nn.Module):
 
     def forward(self, x):
         sl = x.shape[1]
-        return self.emb(torch.arange(0, sl, device=x.device))
+        emb =  self.emb(torch.arange(0, sl, device=x.device))
+        return emb
 
     def get_fixed_embedding(self, ind, dev):
-        return self.emb(torch.tensor([ind], device=dev)).unsqueeze(0)
+        emb = self.emb(torch.tensor([ind], device=dev)).unsqueeze(0)
+        return emb
 
 
 def build_hf_gpt_transformer(layers, model_dim, heads, max_mel_seq_len, max_text_seq_len, checkpointing, activation_function):
@@ -565,6 +575,7 @@ class UnifiedVoice(nn.Module):
 
         conds = speech_conditioning_latent
         text_inputs, text_targets = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
+        print("gpt text:", text_inputs)
         text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
         mel_codes, mel_targets = self.build_aligned_inputs_and_targets(mel_codes, self.start_mel_token, self.stop_mel_token)
         if raw_mels is not None:
@@ -596,11 +607,11 @@ class UnifiedVoice(nn.Module):
 
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs, _ = self.build_aligned_inputs_and_targets(text_inputs, self.start_text_token, self.stop_text_token)
+        print("infer text: ", text_inputs)
         text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs)
-        print("text_emb: ", text_emb[0,0, :10])
         conds = self.get_conditioning(speech_conditioning_latent, cond_mel_lengths) # [1, 32, 1280]
         print("conds: ", conds[0, 0, :10])
-        breakpoint()
+        print("text_emb: ", text_emb[0, 0, :10])
         emb = torch.cat([conds, text_emb], dim=1)
         self.inference_model.store_mel_emb(emb)
 

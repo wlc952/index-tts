@@ -364,7 +364,7 @@ tts = IndexTTS(
     model_dir="checkpoints",
     is_fp16=False,
     use_cuda_kernel=False,
-    device="cpu"
+    device="cpu",
 )
 
 SEQ_LENGTH = 256
@@ -403,7 +403,7 @@ class Block(torch.nn.Module):
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             use_cache=True,
-        )  # type: ignore
+        ) # type: ignore
         hidden_states = hidden_states + residual
         residual = hidden_states
         hidden_states = self.ln_2(hidden_states)  # type: ignore
@@ -412,6 +412,7 @@ class Block(torch.nn.Module):
 
         present_k, present_v = past_kv
         return hidden_states.float(), present_k.float(), present_v.float()
+
 
 class BlockCache(torch.nn.Module):
     def __init__(self, layer_id):
@@ -442,10 +443,11 @@ class BlockCache(torch.nn.Module):
         present_k, present_v = past_kv
         return hidden_states.float(), present_k.float(), present_v.float()
 
+
 def convert_block(layer_id):
     model = Block(layer_id)
     hidden_states = torch.randn((1, SEQ_LENGTH, HIDDEN_SIZE)).to(dtype).to(device)
-    attention_mask = torch.ones((1, 1, 1, SEQ_LENGTH)).to(dtype).to(device)
+    attention_mask = torch.randn((1, 1, SEQ_LENGTH, SEQ_LENGTH)).to(dtype).to(device)
     torch.onnx.export(
         model,
         (hidden_states, attention_mask),
@@ -457,10 +459,11 @@ def convert_block(layer_id):
         opset_version=15,
     )
 
+
 def convert_block_cache(layer_id):
     model = BlockCache(layer_id)
     hidden_states = torch.randn((1, 1, HIDDEN_SIZE)).to(dtype).to(device)
-    attention_mask = torch.ones((1, 1, 1, SEQ_LENGTH+1)).to(dtype).to(device)
+    attention_mask = torch.ones((1, 1, 1, SEQ_LENGTH + 1)).to(dtype).to(device)
     past_k = (
         torch.randn((1, SEQ_LENGTH, NUM_ATTENTION_HEADS, HEAD_DIM)).to(dtype).to(device)
     )
@@ -478,7 +481,6 @@ def convert_block_cache(layer_id):
         do_constant_folding=True,
         opset_version=15,
     )
-
 
 
 def convert_ln_f():
@@ -518,32 +520,6 @@ def convert_ln_f():
     )
 
 
-# Convert the inference model to ONNX format
-def convert_inference_model_embedding():
-    text_inputs = torch.randint(1,100, (1, 1)).to(device)  # 保持为int64类型，只转换设备
-
-    class GPT2InferenceModelEmbedding(torch.nn.Module):
-        def __init__(self):
-            super().__init__()
-            self.embeddings = model1.embeddings
-            self.text_pos_embedding = model1.text_pos_embedding
-
-        def forward(self, text_inputs):
-            text_emb = self.embeddings(text_inputs) # [1,1,1280]
-            text_emb = text_emb + self.text_pos_embedding(text_emb)
-            return text_emb
-
-    torch.onnx.export(
-        GPT2InferenceModelEmbedding(),
-        text_inputs,
-        f"{folder}/inference_model_embedding.onnx",
-        verbose=False,
-        input_names=["text_inputs"],
-        output_names=["hidden_states"],
-        do_constant_folding=True,
-        opset_version=15,
-    )
-
 def convert_lm_head():
     hidden_states = torch.randn((1, 1, HIDDEN_SIZE))
     torch.onnx.export(
@@ -557,9 +533,9 @@ def convert_lm_head():
         opset_version=15,
     )
 
+
 def convert_greedy_head_text():
     class GreedyHead(torch.nn.Module):
-
         def __init__(self):
             super().__init__()
 
@@ -582,6 +558,57 @@ def convert_greedy_head_text():
     )
 
 
+class PenaltySampleHead(torch.nn.Module):
+
+    def __init__(self, top_k = 30, min_tokens_to_keep = 5):
+        super().__init__()
+        self.top_k = top_k
+        self.min_tokens_to_keep = min_tokens_to_keep
+        self.keep_matrix = torch.zeros((1, self.top_k), dtype=torch.bool)
+        self.keep_matrix[0, :self.min_tokens_to_keep] = True
+
+    def forward(self, m_logits, input_ids, top_p, temperature, penalty):
+        # repeat penalty
+        logits = torch.gather(m_logits, 1, input_ids)
+        logits = torch.where(logits < 0, logits * penalty, logits / penalty)
+        m_logits.scatter_(1, input_ids, logits)
+
+        # top_k
+        logits, token = torch.topk(m_logits.float(), self.top_k)
+
+        # temperature
+        logits = logits / temperature
+
+        # top_p
+        cumulative_probs = logits.softmax(dim=1).cumsum(dim=1)
+        mask = cumulative_probs < top_p
+        mask = mask + self.keep_matrix
+        filtered_logits = torch.where(mask, logits, torch.FloatTensor([-1000.]))
+        probs = filtered_logits.softmax(dim=1)
+        return probs, token
+
+
+def convert_penalty_sample_head():
+    model = PenaltySampleHead()
+    m_logits = torch.randn(1, 8194)
+    input_ids = torch.tensor([range(SEQ_LENGTH)])
+    top_p = torch.tensor([0.8])
+    temperature = torch.tensor([0.98])
+    penalty = torch.tensor([0.98])
+
+    torch.onnx.export(
+        model, (m_logits, input_ids, top_p, temperature, penalty),
+        f'{folder}/penalty_sample_head.onnx',
+        verbose=False,
+        input_names=[
+            'm_logits', 'input_ids', 'top_p', 'temperature',
+            'penalty'
+        ],
+        output_names=['probs', 'token'],
+        do_constant_folding=True,
+        opset_version=15)
+
+
 def convert_conds_encoder():
     class conds_encoder(torch.nn.Module):
         def __init__(self):
@@ -595,7 +622,9 @@ def convert_conds_encoder():
             )
 
         def forward(self, speech_conditioning_input, cond_mel_lengths):
-            speech_conditioning, _ = self.conditioning_encoder(speech_conditioning_input,  cond_mel_lengths) # type: ignore
+            speech_conditioning, _ = self.conditioning_encoder(
+                speech_conditioning_input, cond_mel_lengths
+            )  # type: ignore
             conds = self.perceiver_encoder(speech_conditioning, self.conds_mask)
             return conds
 
@@ -614,57 +643,87 @@ def convert_conds_encoder():
         opset_version=15,
     )
 
+
 def convert_embedding():
-    inputs = torch.randint(10, 1000, (1, SEQ_LENGTH)).to(device)  # 保持为int64类型，只转换设备
+    inputs = torch.randint(10, 1000, (1, SEQ_LENGTH))
+    position = torch.arange(0, SEQ_LENGTH)
+    cache_position = torch.tensor([200])
+    cache_inputs = torch.tensor([[8192]])
+
     class TextEmbedding(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.text_embedding = tts.gpt.text_embedding
-            self.text_pos_embedding = tts.gpt.text_pos_embedding
+            self.text_pos_embedding = tts.gpt.text_pos_embedding.emb
 
-        def forward(self, text_inputs, text_inputs2):
-            text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(text_inputs2)
+        def forward(self, text_inputs, position_ids):
+            text_emb = self.text_embedding(text_inputs) + self.text_pos_embedding(
+                position_ids
+            )
             return text_emb
+
+    class TextEmbeddingCache(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.emb = model1.text_pos_embedding.emb
+            self.embeddings = model1.embeddings
+
+        def forward(self, text_inputs, position_ids):
+            hidden_states = self.embeddings(text_inputs)
+            pos_emb = self.emb(position_ids).unsqueeze(0)
+            return pos_emb + hidden_states
 
     class MelEmbedding(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.mel_embedding = tts.gpt.mel_embedding
-            self.mel_pos_embedding = tts.gpt.mel_pos_embedding
+            self.mel_pos_embedding = tts.gpt.mel_pos_embedding.emb
 
-        def forward(self, mel_inputs):
-            mel_emb = self.mel_embedding(mel_inputs) + self.mel_pos_embedding(mel_inputs)
+        def forward(self, mel_inputs, position):
+            mel_emb = self.mel_embedding(mel_inputs) + self.mel_pos_embedding(position)
             return mel_emb
-    
+
     torch.onnx.export(
         TextEmbedding(),
-        (inputs, inputs),
+        (inputs, position),
         f"{folder}/text_embedding.onnx",
         verbose=False,
-        input_names=["text_inputs", "text_inputs2"],
+        input_names=["text_inputs", "position"],
+        output_names=["text_emb"],
+        do_constant_folding=True,
+        opset_version=15,
+    )
+    torch.onnx.export(
+        TextEmbeddingCache(),
+        (cache_inputs, cache_position),
+        f"{folder}/text_embedding_cache.onnx",
+        verbose=False,
+        input_names=["text_inputs", "position"],
         output_names=["text_emb"],
         do_constant_folding=True,
         opset_version=15,
     )
     torch.onnx.export(
         MelEmbedding(),
-        inputs,
+        (inputs, position),
         f"{folder}/mel_embedding.onnx",
         verbose=False,
-        input_names=["mel_inputs"],
+        input_names=["mel_inputs", "position"],
         output_names=["mel_emb"],
         do_constant_folding=True,
         opset_version=15,
     )
+
 
 def convert_final_norm():
     class FinalNorm(torch.nn.Module):
         def __init__(self):
             super().__init__()
             self.final_norm = model1.final_norm
+
         def forward(self, enc):
             return self.final_norm(enc)
-    
+
     enc = torch.randn((1, SEQ_LENGTH - 32, HIDDEN_SIZE)).to(dtype).to(device)
     torch.onnx.export(
         FinalNorm(),
@@ -683,11 +742,9 @@ def convert_final_norm():
 #     convert_block_cache(i)
 
 # convert_ln_f()
-# convert_inference_model_embedding()
 # convert_lm_head()
 # convert_greedy_head_text()
-
-convert_conds_encoder()
+# convert_penalty_sample_head()
+# convert_conds_encoder()
 # convert_embedding()
 # convert_final_norm()
-

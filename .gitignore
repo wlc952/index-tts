@@ -17,6 +17,7 @@ build/
 *.tar.gz
 onnx
 gen.wav
+test.wav
 test.py
 *.npz
 tmp

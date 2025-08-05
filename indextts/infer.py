@@ -445,8 +445,10 @@ class IndexTTS:
             print("text token count:", len(text_tokens_list))
             print("sentences count:", len(sentences))
             print(*sentences, sep="\n")
-        top_p = 0.8
-        top_k = 30
+        # top_p = 0.8
+        # top_k = 30
+        top_p = 1.0
+        top_k = 1
         temperature = 1.0
         autoregressive_batch_size = 1
         length_penalty = 0.0
@@ -519,6 +521,8 @@ class IndexTTS:
                                     cond_mel_lengths=torch.tensor([auto_conditioning.shape[-1]], device=text_tokens.device),
                                     return_latent=True, clip_inputs=False)
                     gpt_forward_time += time.perf_counter() - m_start_time
+
+                    # breakpoint()
 
                     m_start_time = time.perf_counter()
                     debug = False
