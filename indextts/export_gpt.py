@@ -385,64 +385,138 @@ gpt = model1.transformer
 layers = gpt.h
 
 
-# Convert gpt2 to ONNX format
+# class Block(torch.nn.Module):
+#     def __init__(self, layer_id):
+#         super().__init__()
+#         self.layer_id = layer_id
+#         self.layer = layers[layer_id]
+#         self.ln_1 = self.layer.ln_1
+#         self.attn = self.layer.attn
+#         self.ln_2 = self.layer.ln_2
+#         self.mlp = self.layer.mlp
+
+#     def forward(self, hidden_states, attention_mask):
+#         residual = hidden_states
+#         hidden_states = self.ln_1(hidden_states)  # type: ignore
+#         hidden_states, past_kv = self.attn(
+#             hidden_states=hidden_states,
+#             attention_mask=attention_mask,
+#             use_cache=True,
+#         ) # type: ignore
+#         hidden_states = hidden_states + residual
+#         residual = hidden_states
+#         hidden_states = self.ln_2(hidden_states)  # type: ignore
+#         hidden_states = self.mlp(hidden_states)  # type: ignore
+#         hidden_states = hidden_states + residual
+
+#         present_k, present_v = past_kv
+#         return hidden_states.float(), present_k.float(), present_v.float()
+
 class Block(torch.nn.Module):
     def __init__(self, layer_id):
         super().__init__()
-        self.layer_id = layer_id
-        self.layer = layers[layer_id]
-        self.ln_1 = self.layer.ln_1
-        self.attn = self.layer.attn
-        self.ln_2 = self.layer.ln_2
-        self.mlp = self.layer.mlp
-
+        self.model = tts.gpt.inference_model.transformer.h[layer_id]
     def forward(self, hidden_states, attention_mask):
         residual = hidden_states
-        hidden_states = self.ln_1(hidden_states)  # type: ignore
-        hidden_states, past_kv = self.attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            use_cache=True,
-        ) # type: ignore
-        hidden_states = hidden_states + residual
-        residual = hidden_states
-        hidden_states = self.ln_2(hidden_states)  # type: ignore
-        hidden_states = self.mlp(hidden_states)  # type: ignore
-        hidden_states = hidden_states + residual
+        hidden_states = self.model.ln_1(hidden_states)
+        q = torch.matmul(hidden_states, self.model.attn.c_attn.weight[:,:1280]) + self.model.attn.c_attn.bias[:1280]
+        k = torch.matmul(hidden_states, self.model.attn.c_attn.weight[:,1280:2560]) + self.model.attn.c_attn.bias[1280:2560]
+        v = torch.matmul(hidden_states, self.model.attn.c_attn.weight[:,2560:]) + self.model.attn.c_attn.bias[2560:]
+        q = q.view(1,256,20,64)
+        k = k.view(1,256,20,64)
+        v = v.view(1,256,20,64)
+        present_k = k
+        present_v = v
+        q = q.permute(0,2,1,3)
+        k = k.permute(0,2,1,3)
+        v = v.permute(0,2,1,3)
+        attn_weights = torch.matmul(q, k.transpose(-1, -2))/8 # attn_head_size ** 0.5
 
-        present_k, present_v = past_kv
+        attn_weights = attn_weights + attention_mask
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+        
+        hidden_states = torch.matmul(attn_weights, v)
+        hidden_states = hidden_states.permute(0,2,1,3).contiguous().view(1,256,1280)
+        hidden_states = torch.matmul(hidden_states, self.model.attn.c_proj.weight) + self.model.attn.c_proj.bias
+        hidden_states = hidden_states + residual
+        
+        # LN MLP
+        residual = hidden_states
+        hidden_states = self.model.ln_2(hidden_states)
+        hidden_states = torch.matmul(hidden_states, self.model.mlp.c_fc.weight) + self.model.mlp.c_fc.bias
+        hidden_states = self.model.mlp.act(hidden_states)
+        hidden_states = torch.matmul(hidden_states, self.model.mlp.c_proj.weight) + self.model.mlp.c_proj.bias
+        hidden_states = hidden_states + residual
         return hidden_states.float(), present_k.float(), present_v.float()
 
+
+# class BlockCache(torch.nn.Module):
+#     def __init__(self, layer_id):
+#         super().__init__()
+#         self.layer_id = layer_id
+#         self.layer = layers[layer_id]
+#         self.ln_1 = self.layer.ln_1
+#         self.attn = self.layer.attn
+#         self.ln_2 = self.layer.ln_2
+#         self.mlp = self.layer.mlp
+
+#     def forward(self, hidden_states, attention_mask, past_k, past_v):
+#         residual = hidden_states
+#         hidden_states = self.ln_1(hidden_states)  # type: ignore
+
+#         hidden_states, past_kv = self.attn(
+#             hidden_states=hidden_states,
+#             attention_mask=attention_mask,
+#             layer_past=(past_k, past_v),
+#             use_cache=True,
+#         )  # type: ignore
+#         hidden_states = hidden_states + residual
+#         residual = hidden_states
+#         hidden_states = self.ln_2(hidden_states)  # type: ignore
+#         hidden_states = self.mlp(hidden_states)  # type: ignore
+#         hidden_states = hidden_states + residual
+
+#         present_k, present_v = past_kv
+#         return hidden_states.float(), present_k.float(), present_v.float()
 
 class BlockCache(torch.nn.Module):
     def __init__(self, layer_id):
         super().__init__()
-        self.layer_id = layer_id
-        self.layer = layers[layer_id]
-        self.ln_1 = self.layer.ln_1
-        self.attn = self.layer.attn
-        self.ln_2 = self.layer.ln_2
-        self.mlp = self.layer.mlp
-
+        self.model = tts.gpt.inference_model.transformer.h[layer_id]
     def forward(self, hidden_states, attention_mask, past_k, past_v):
         residual = hidden_states
-        hidden_states = self.ln_1(hidden_states)  # type: ignore
+        hidden_states = self.model.ln_1(hidden_states)
+        q = torch.matmul(hidden_states, self.model.attn.c_attn.weight[:,:1280]) + self.model.attn.c_attn.bias[:1280]
+        k = torch.matmul(hidden_states, self.model.attn.c_attn.weight[:,1280:2560]) + self.model.attn.c_attn.bias[1280:2560]
+        v = torch.matmul(hidden_states, self.model.attn.c_attn.weight[:,2560:]) + self.model.attn.c_attn.bias[2560:]
+        q = q.view(1,1,20,64)
+        k = k.view(1,1,20,64)
+        v = v.view(1,1,20,64)
+        present_k = k
+        present_v = v
+        k = torch.cat((past_k, k), dim=1)
+        v = torch.cat((past_v, v), dim=1)
+        q = q.permute(0,2,1,3)
+        k = k.permute(0,2,1,3)
+        v = v.permute(0,2,1,3)
+        attn_weights = torch.matmul(q, k.transpose(-1, -2))/8 # attn_head_size ** 0.5
 
-        hidden_states, past_kv = self.attn(
-            hidden_states=hidden_states,
-            attention_mask=attention_mask,
-            layer_past=(past_k, past_v),
-            use_cache=True,
-        )  # type: ignore
+        attn_weights = attn_weights + attention_mask
+        attn_weights = torch.nn.functional.softmax(attn_weights, dim=-1)
+        
+        hidden_states = torch.matmul(attn_weights, v)
+        hidden_states = hidden_states.permute(0,2,1,3).contiguous().view(1,1,1280)
+        hidden_states = torch.matmul(hidden_states, self.model.attn.c_proj.weight) + self.model.attn.c_proj.bias
         hidden_states = hidden_states + residual
+        
+        # LN MLP
         residual = hidden_states
-        hidden_states = self.ln_2(hidden_states)  # type: ignore
-        hidden_states = self.mlp(hidden_states)  # type: ignore
+        hidden_states = self.model.ln_2(hidden_states)
+        hidden_states = torch.matmul(hidden_states, self.model.mlp.c_fc.weight) + self.model.mlp.c_fc.bias
+        hidden_states = self.model.mlp.act(hidden_states)
+        hidden_states = torch.matmul(hidden_states, self.model.mlp.c_proj.weight) + self.model.mlp.c_proj.bias
         hidden_states = hidden_states + residual
-
-        present_k, present_v = past_kv
         return hidden_states.float(), present_k.float(), present_v.float()
-
 
 def convert_block(layer_id):
     model = Block(layer_id)
@@ -736,10 +810,9 @@ def convert_final_norm():
         opset_version=15,
     )
 
-
-# for i in range(NUM_BLOCKS):
-#     convert_block(i)
-#     convert_block_cache(i)
+for i in range(NUM_BLOCKS):
+    convert_block(i)
+    convert_block_cache(i)
 
 # convert_ln_f()
 # convert_lm_head()

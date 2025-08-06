@@ -4,7 +4,7 @@ models=""
 name="indextts"
 chip="bm1684x"
 out_model=$name.bmodel
-mode="f32"
+mode="f16"
 
 seq_length=256
 hidden_size=1280
@@ -31,7 +31,9 @@ process_block()
 
     model_deploy.py \
         --mlir block_$i.mlir \
-        --quantize F16 \
+        --quantize W4F16 --q_group_size 64 \
+        --quant_input \
+        --quant_output \
         --chip ${chip} \
         --model block_$i.bmodel
 
@@ -42,7 +44,9 @@ process_block()
 
     model_deploy.py \
         --mlir block_cache_$i.mlir \
-        --quantize F16 \
+        --quantize W4F16 --q_group_size 64 \
+        --quant_input \
+        --quant_output \
         --chip ${chip} \
         --addr_mode io_alone \
         --model block_cache_$i.bmodel
@@ -70,7 +74,8 @@ pushd $outdir
 
 # model_deploy.py \
 #     --mlir mel_embedding.mlir \
-#     --quantize F32 \
+#     --quantize F16 \
+#     --quant_output \
 #     --chip ${chip} \
 #     --model mel_embedding.bmodel
 
@@ -81,7 +86,8 @@ pushd $outdir
 
 # model_deploy.py \
 #     --mlir text_embedding.mlir \
-#     --quantize F32 \
+#     --quantize F16 \
+#     --quant_output \
 #     --chip ${chip} \
 #     --addr_mode io_alone \
 #     --model text_embedding.bmodel
@@ -93,7 +99,8 @@ pushd $outdir
 
 # model_deploy.py \
 #     --mlir text_embedding_cache.mlir \
-#     --quantize F32 \
+#     --quantize F16 \
+#     --quant_output \
 #     --chip ${chip} \
 #     --addr_mode io_alone \
 #     --model text_embedding_cache.bmodel
@@ -127,7 +134,9 @@ pushd $outdir
 
 # model_deploy.py \
 #     --mlir lm_head.mlir \
-#     --quantize F32 \
+#     --quantize F16 \
+#     --quant_input \
+#     --quant_output \
 #     --chip ${chip} \
 #     --model lm_head.bmodel
 
@@ -138,7 +147,8 @@ pushd $outdir
 
 # model_deploy.py \
 #     --mlir penalty_sample_head.mlir \
-#     --quantize F32 \
+#     --quantize F16 \
+#     --quant_input \
 #     --chip ${chip} \
 #     --model penalty_sample_head.bmodel
 
@@ -149,7 +159,9 @@ pushd $outdir
 
 # model_deploy.py \
 #     --mlir ln_f.mlir \
-#     --quantize F32 \
+#     --quantize F16 \
+#     --quant_input \
+#     --quant_output \
 #     --chip ${chip} \
 #     --model ln_f.bmodel
 
@@ -160,20 +172,24 @@ pushd $outdir
 
 # model_deploy.py \
 #     --mlir ln_f2.mlir \
-#     --quantize F32 \
+#     --quantize F16 \
+#     --quant_input \
+#     --quant_output \
 #     --chip ${chip} \
 #     --model ln_f2.bmodel
 
-# model_transform.py \
-#     --model_name final_norm \
-#     --model_def ${onnx_dir}/final_norm.onnx \
-#     --mlir final_norm.mlir
+model_transform.py \
+    --model_name final_norm \
+    --model_def ${onnx_dir}/final_norm.onnx \
+    --mlir final_norm.mlir
 
-# model_deploy.py \
-#     --mlir final_norm.mlir \
-#     --quantize F32 \
-#     --chip ${chip} \
-#     --model final_norm.bmodel
+model_deploy.py \
+    --mlir final_norm.mlir \
+    --quantize F16 \
+    --quant_input \
+    --quant_output \
+    --chip ${chip} \
+    --model final_norm.bmodel
 
 
 models=${models}${outdir}'/lm_head.bmodel '${outdir}'/penalty_sample_head.bmodel '${outdir}'/ln_f.bmodel '${outdir}'/ln_f2.bmodel '${outdir}'/final_norm.bmodel '
@@ -185,28 +201,30 @@ outdir=${folder}/bigvgan
 mkdir -p $outdir
 pushd $outdir
 
-# model_transform.py \
-#     --model_name speaker_encoder \
-#     --model_def ${onnx_dir}/bigvgan_speaker_encoder.onnx \
-#     --mlir speaker_encoder.mlir
+model_transform.py \
+    --model_name speaker_encoder \
+    --model_def ${onnx_dir}/bigvgan_speaker_encoder.onnx \
+    --mlir speaker_encoder.mlir
 
-# model_deploy.py \
-#     --mlir speaker_encoder.mlir \
-#     --quantize F16 \
-#     --chip ${chip} \
-#     --addr_mode io_alone \
-#     --model speaker_encoder.bmodel
+model_deploy.py \
+    --mlir speaker_encoder.mlir \
+    --quantize F16 \
+    --quant_output \
+    --chip ${chip} \
+    --addr_mode io_alone \
+    --model speaker_encoder.bmodel
 
-# model_transform.py \
-#     --model_name bigvgan \
-#     --model_def ${onnx_dir}/bigvgan_filter_approximated.onnx \
-#     --mlir bigvgan.mlir
+model_transform.py \
+    --model_name bigvgan \
+    --model_def ${onnx_dir}/bigvgan_filter_approximated.onnx \
+    --mlir bigvgan.mlir
 
-# model_deploy.py \
-#     --mlir bigvgan.mlir \
-#     --quantize F16 \
-#     --chip ${chip} \
-#     --model bigvgan.bmodel
+model_deploy.py \
+    --mlir bigvgan.mlir \
+    --quantize F16 \
+    --quant_input \
+    --chip ${chip} \
+    --model bigvgan.bmodel
 
 models=${models}${outdir}'/speaker_encoder.bmodel '${outdir}'/bigvgan.bmodel '
 popd

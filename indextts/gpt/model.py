@@ -154,6 +154,20 @@ class GPT2InferenceModel(GPT2PreTrainedModel):
             emb = emb + self.text_pos_embedding.get_fixed_embedding(
                 attention_mask.shape[1] - mel_len, attention_mask.device
             )
+        
+        # import numpy as np
+        # input_states = emb.detach().cpu().numpy()
+        # input_states = np.pad(input_states, ((0, 0), (0, 256 - input_states.shape[1]), (0, 0)), mode='constant')
+        # mask = torch.ones((256, 256)).float() * -10000.0
+        # for i in range(attention_mask.shape[1]):
+        #     for j in range(attention_mask.shape[1]):
+        #         if j <= i:
+        #             mask[i][j] = 0.0
+        # mask = mask.view(1, 1, 256, 256)
+        # np.savez("emb_pad.npz", input_states=input_states,
+        #          attention_mask=mask)
+        # np.savez("emb_pad.npz", input_states=emb.detach().cpu().numpy(),
+        #          attention_mask=attention_mask.numpy())
 
         transformer_outputs = self.transformer(
             inputs_embeds=emb,
