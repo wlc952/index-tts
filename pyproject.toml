@@ -5,7 +5,9 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
+    "dfss>=1.10.4",
     "einops==0.8.1",
+    "gradio>=5.41.0",
     "omegaconf>=2.3.0",
     "sentencepiece>=0.2.0",
     "tokenizers==0.15.0",

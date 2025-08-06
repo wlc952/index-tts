@@ -267,10 +267,10 @@ class IndexTTS:
         for i in range(self.num_blocks):
             net_id = self.block_ids[i]
             in_tensor_0 = self.input_tensors[net_id][0]
-            in_tensor_1 = self.input_tensors[net_id][1]
-            self.s2d_bytes(in_tensor_1, attn_mask_ptr, in_tensor_1.contents.size)
 
             if i == 0:
+                in_tensor_1 = self.input_tensors[net_id][1]
+                self.s2d_bytes(in_tensor_1, attn_mask_ptr, in_tensor_1.contents.size)
                 self.d2d_bytes_offset(in_tensor, conds, 0, 0, conds.contents.size)
                 self.d2d_bytes_offset(
                     in_tensor, text_emb, conds.contents.size, 0, bytes_size * self.L1
@@ -322,7 +322,7 @@ class IndexTTS:
         )
         return latent
 
-    def inference_speech(self, text_inputs):
+    def inference_speech(self, text_inputs, top_k=1, top_p=1.0, temperature=1.0, repetition_penalty=10.0):
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs, _ = self.build_aligned_inputs_and_targets(
             text_inputs, self.start_text_token, self.stop_text_token
@@ -343,11 +343,11 @@ class IndexTTS:
         self.s2d_bytes(in_tensor_1, position_ids_ptr, in_tensor_1.contents.size)
         self.run(self.text_embedding_idx)
 
-        codes = self._inference_speech_generate()
+        codes = self._inference_speech_generate(top_k, top_p, temperature, repetition_penalty)
         return torch.tensor([codes])
 
     def _inference_speech_generate(
-        self, top_k=1, top_p=1.0, temperature=1.0, penalty=10.0
+        self, top_k=1, top_p=1.0, temperature=1.0, repetition_penalty=10.0
     ):
         self.token_length = 32 + self.L1
         token = self.start_mel_token
@@ -356,7 +356,7 @@ class IndexTTS:
         first = True
         codes = [1] * self.token_length + [token]
 
-        while self.token_length < 224 and token != self.stop_mel_token:
+        while self.token_length < self.SEQLEN and token != self.stop_mel_token:
             self.token_length += 1
             pos += 1
             input_ids = np.array([token], dtype=np.int32)
@@ -378,6 +378,7 @@ class IndexTTS:
                 self._gpt_forward_next()
             out_tensor = self.output_tensors[self.ln_f_idx][0]
             # untensor_show(out_tensor, 0, 10, b"d")
+            # breakpoint()
 
             # lm_head
             in_tensor = self.input_tensors[self.lm_head_idx][0]
@@ -423,7 +424,7 @@ class IndexTTS:
             self.s2d_bytes(
                 in_tensor_3, temperature_tensor_ptr, in_tensor_3.contents.size
             )
-            penalty_tensor = np.array([penalty], dtype=np.float32)
+            penalty_tensor = np.array([repetition_penalty], dtype=np.float32)
             penalty_tensor_ptr = ctypes.c_void_p(penalty_tensor.ctypes.data)
             self.s2d_bytes(in_tensor_4, penalty_tensor_ptr, in_tensor_4.contents.size)
             self.run(self.penalty_sample_head_idx)
@@ -459,24 +460,24 @@ class IndexTTS:
             net_id = self.block_ids[i]
             cache_id = self.block_cache_ids[i]
             in_tensor_0 = self.input_tensors[net_id][0]
-            in_tensor_1 = self.input_tensors[net_id][1]
-            self.s2d_bytes(in_tensor_1, attn_mask_ptr, in_tensor_1.contents.size)
 
             if i == 0:
+                in_tensor_1 = self.input_tensors[net_id][1]
+                self.s2d_bytes(in_tensor_1, attn_mask_ptr, in_tensor_1.contents.size)
                 self.d2d_bytes_offset(in_tensor_0, conds, 0, 0, conds.contents.size)
                 self.d2d_bytes_offset(
                     in_tensor_0,
                     text_emb,
                     conds.contents.size,
                     0,
-                    bytes_size * self.L1,
+                    bytes_size * (self.SEQLEN - 32),
                 )
                 self.d2d_bytes_offset(
                     in_tensor_0,
                     text_emb2,
                     bytes_size * (self.L1 + 32),
                     0,
-                    bytes_size * (self.SEQLEN - self.L1 - 32),
+                    bytes_size,
                 )
             else:
                 self.d2d_bytes_offset(
@@ -486,6 +487,8 @@ class IndexTTS:
             self.run(net_id)
 
             out_tensor = self.output_tensors[net_id][0]
+            # untensor_show(out_tensor, 0, 10, b"d")
+            # breakpoint()
             self.d2d_bytes_offset(
                 self.input_tensors[cache_id][2],
                 self.output_tensors[net_id][1],
@@ -715,7 +718,11 @@ class IndexTTS:
         text,
         output_path,
         verbose=False,
-        max_text_tokens_per_sentence=120,
+        max_text_tokens_per_sentence=80,
+        top_k=1,
+        top_p=1.0,
+        temperature=1.0,
+        repetition_penalty=10.0
     ):
         print(">> start inference...")
         if verbose:
@@ -796,7 +803,7 @@ class IndexTTS:
                 )
 
             m_start_time = time.perf_counter()
-            codes = self.inference_speech(text_tokens)
+            codes = self.inference_speech(text_tokens, top_k, top_p, temperature, repetition_penalty)
             gpt_gen_time += time.perf_counter() - m_start_time
 
             code_lens = torch.tensor([codes.shape[-1]])
@@ -870,7 +877,7 @@ class IndexTTS:
 
 if __name__ == "__main__":
     prompt_wav = "tests/sample_prompt.wav"
-    text = "There is a vehicle arriving in dock number 7?"
+    text = "大家好，我现在正在bilibili 体验 ai 科技，说实话，来之前我绝对想不到！AI技术已经发展到这样匪夷所思的地步了！"
 
     tts = IndexTTS(cfg_path="checkpoints/config.yaml", model_dir="checkpoints")
     tts.infer(audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)
