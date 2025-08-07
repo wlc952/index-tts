@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils.feature_extractors import MelSpectrogramFeatures
 from utils.front import TextNormalizer, TextTokenizer
-
+from utils.common import cal_topk
 
 class IndexTTS:
     def __init__(
@@ -288,10 +288,10 @@ class IndexTTS:
         out_tensor = self.output_tensors[self.final_norm_idx][0]
         untensor_sync(out_tensor, False, True)
         shape = (1, 224, 1280)
-        size = out_tensor.contents.size // 2  # f16
-        buf_type = ctypes.c_uint16 * size
+        size = out_tensor.contents.size // 4
+        buf_type = ctypes.c_float * size
         buf = ctypes.cast(out_tensor.contents.data, ctypes.POINTER(buf_type)).contents
-        latent = np.frombuffer(buf, dtype=np.uint16).reshape(shape)[
+        latent = np.frombuffer(buf, dtype=np.float32).reshape(shape)[
             :, self.L1 : self.L1 + self.L2 - 2, :
         ]  # [1, L1 : L1 + L2 - 2, 1280]
         self.ori_latent_len = latent.shape[1]
@@ -303,7 +303,9 @@ class IndexTTS:
         )
         return latent
 
-    def inference_speech(self, text_inputs):
+    def inference_speech(
+        self, text_inputs, top_k=1, top_p=1.0, temperature=1.0, repetition_penalty=10.0
+    ):
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs, _ = self.build_aligned_inputs_and_targets(
             text_inputs, self.start_text_token, self.stop_text_token
@@ -332,7 +334,9 @@ class IndexTTS:
             :, : self.L1, :
         ]
 
-        codes = self._inference_speech_generate()
+        codes = self._inference_speech_generate(
+            top_k, top_p, temperature, repetition_penalty
+        )
         return torch.tensor([codes])
 
     def _inference_speech_generate(
@@ -430,7 +434,7 @@ class IndexTTS:
             untensor_sync(out_tensor, False, True)
             shape = (30,)
             size = out_tensor.contents.size // 4  # int32
-            buf_type = ctypes.c_float * size
+            buf_type = ctypes.c_int32 * size
             buf = ctypes.cast(
                 out_tensor.contents.data, ctypes.POINTER(buf_type)
             ).contents
@@ -706,6 +710,10 @@ class IndexTTS:
         output_path,
         verbose=False,
         max_text_tokens_per_sentence=80,
+        top_k=1,
+        top_p=0.8,
+        temperature=1.0,
+        repetition_penalty=10.0,
     ):
         print(">> start inference...")
         if verbose:
@@ -800,7 +808,9 @@ class IndexTTS:
                 )
 
             m_start_time = time.perf_counter()
-            codes = self.inference_speech(text_tokens)
+            codes = self.inference_speech(
+                text_tokens, top_k, top_p, temperature, repetition_penalty
+            )
             gpt_gen_time += time.perf_counter() - m_start_time
 
             code_lens = torch.tensor([codes.shape[-1]])
@@ -874,7 +884,12 @@ class IndexTTS:
 
 if __name__ == "__main__":
     prompt_wav = "tests/sample_prompt.wav"
-    text = "大家好，我现在正在bilibili 体验 ai 科技，说实话，来之前我绝对想不到！AI技术已经发展到这样匪夷所思的地步了！"
+    text = """《盗梦空间》是由美国华纳兄弟影片公司出品的电影，由克里斯托弗·诺兰执导并编剧，
+莱昂纳多·迪卡普里奥、玛丽昂·歌迪亚、约瑟夫·高登-莱维特、艾利奥特·佩吉、汤姆·哈迪等联袂主演，
+2010年7月16日在美国上映，2010年9月1日在中国内地上映，2020年8月28日在中国内地重映。
+影片剧情游走于梦境与现实之间，被定义为“发生在意识结构内的当代动作科幻片”，
+讲述了由莱昂纳多·迪卡普里奥扮演的造梦师，带领特工团队进入他人梦境，从他人的潜意识中盗取机密，并重塑他人梦境的故事。
+""".replace("\n", "")
 
     tts = IndexTTS(cfg_path="checkpoints/config.yaml", model_dir="checkpoints")
     tts.infer(audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)

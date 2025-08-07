@@ -31,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from utils.feature_extractors import MelSpectrogramFeatures
 from utils.front import TextNormalizer, TextTokenizer
-
+from utils.common import cal_topk
 
 class IndexTTS:
     def __init__(
@@ -292,9 +292,7 @@ class IndexTTS:
         # ln_f
         in_tensor = self.input_tensors[self.ln_f2_idx][0]
         src_offset = bytes_size * 32
-        self.d2d_bytes_offset(
-            in_tensor, out_tensor, 0, src_offset, bytes_size * 224
-        )
+        self.d2d_bytes_offset(in_tensor, out_tensor, 0, src_offset, bytes_size * 224)
         self.run(self.ln_f2_idx)
         out_tensor = self.output_tensors[self.ln_f2_idx][0]
         in_tensor = self.input_tensors[self.final_norm_idx][0]
@@ -322,7 +320,9 @@ class IndexTTS:
         )
         return latent
 
-    def inference_speech(self, text_inputs, top_k=1, top_p=1.0, temperature=1.0, repetition_penalty=10.0):
+    def inference_speech(
+        self, text_inputs, top_k=1, top_p=1.0, temperature=1.0, repetition_penalty=10.0
+    ):
         text_inputs = F.pad(text_inputs, (0, 1), value=self.stop_text_token)
         text_inputs, _ = self.build_aligned_inputs_and_targets(
             text_inputs, self.start_text_token, self.stop_text_token
@@ -343,7 +343,9 @@ class IndexTTS:
         self.s2d_bytes(in_tensor_1, position_ids_ptr, in_tensor_1.contents.size)
         self.run(self.text_embedding_idx)
 
-        codes = self._inference_speech_generate(top_k, top_p, temperature, repetition_penalty)
+        codes = self._inference_speech_generate(
+            top_k, top_p, temperature, repetition_penalty
+        )
         return torch.tensor([codes])
 
     def _inference_speech_generate(
@@ -434,13 +436,11 @@ class IndexTTS:
             untensor_sync(out_tensor, False, True)
             shape = (30,)
             size = out_tensor.contents.size // 4  # int32
-            buf_type = ctypes.c_float * size
+            buf_type = ctypes.c_int32 * size
             buf = ctypes.cast(
                 out_tensor.contents.data, ctypes.POINTER(buf_type)
             ).contents
             tokens = np.frombuffer(buf, dtype=np.int32).reshape(shape)
-            # breakpoint()
-
             token = tokens[0]
             codes.append(token)
 
@@ -576,7 +576,9 @@ class IndexTTS:
         self._attn_mask[token_len - 1 : seq_len] = -10000.0
         return ctypes.c_void_p(self._attn_mask.ctypes.data)
 
-    def remove_long_silence(self, codes: torch.Tensor, silent_token=52, max_consecutive=30):
+    def remove_long_silence(
+        self, codes: torch.Tensor, silent_token=52, max_consecutive=30
+    ):
         code_lens = []
         codes_list = []
         device = codes.device
@@ -722,7 +724,7 @@ class IndexTTS:
         top_k=1,
         top_p=1.0,
         temperature=1.0,
-        repetition_penalty=10.0
+        repetition_penalty=10.0,
     ):
         print(">> start inference...")
         if verbose:
@@ -803,7 +805,9 @@ class IndexTTS:
                 )
 
             m_start_time = time.perf_counter()
-            codes = self.inference_speech(text_tokens, top_k, top_p, temperature, repetition_penalty)
+            codes = self.inference_speech(
+                text_tokens, top_k, top_p, temperature, repetition_penalty
+            )
             gpt_gen_time += time.perf_counter() - m_start_time
 
             code_lens = torch.tensor([codes.shape[-1]])
@@ -877,7 +881,12 @@ class IndexTTS:
 
 if __name__ == "__main__":
     prompt_wav = "tests/sample_prompt.wav"
-    text = "大家好，我现在正在bilibili 体验 ai 科技，说实话，来之前我绝对想不到！AI技术已经发展到这样匪夷所思的地步了！"
+    text = """《盗梦空间》是由美国华纳兄弟影片公司出品的电影，由克里斯托弗·诺兰执导并编剧，
+莱昂纳多·迪卡普里奥、玛丽昂·歌迪亚、约瑟夫·高登-莱维特、艾利奥特·佩吉、汤姆·哈迪等联袂主演，
+2010年7月16日在美国上映，2010年9月1日在中国内地上映，2020年8月28日在中国内地重映。
+影片剧情游走于梦境与现实之间，被定义为“发生在意识结构内的当代动作科幻片”，
+讲述了由莱昂纳多·迪卡普里奥扮演的造梦师，带领特工团队进入他人梦境，从他人的潜意识中盗取机密，并重塑他人梦境的故事。
+""".replace("\n", "")
 
     tts = IndexTTS(cfg_path="checkpoints/config.yaml", model_dir="checkpoints")
     tts.infer(audio_prompt=prompt_wav, text=text, output_path="gen.wav", verbose=True)

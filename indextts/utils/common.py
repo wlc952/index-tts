@@ -4,6 +4,7 @@ import re
 
 import torch
 import torchaudio
+import numpy as np
 
 MATPLOTLIB_FLAG = False
 
@@ -119,3 +120,15 @@ def safe_log(x: torch.Tensor, clip_val: float = 1e-7) -> torch.Tensor:
         Tensor: Element-wise logarithm of the input tensor with clipping applied.
     """
     return torch.log(torch.clip(x, min=clip_val))
+
+def cal_topk(probs: np.ndarray, tokens: np.ndarray, top_k: int = 1) -> int:
+    probs = probs[:top_k]  # 只取前 top_k 个概率
+    tokens = tokens[:top_k]  # 只取前 top_k 个 token
+    # 1. （可选）归一化概率，保证 sum(probs)==1
+    probs = probs.astype(np.float64)
+    probs = probs / probs.sum()
+    # 2. 根据 probs[p] 的权重，在 [0..N-1] 中选一个下标
+    idx = np.random.choice(probs.shape[0], p=probs)
+    # 3. 用该下标到 tokens 中取出真实的 token id
+    next_token = int(tokens[idx])
+    return next_token

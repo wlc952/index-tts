@@ -46,7 +46,8 @@ for file in [
 
 import gradio as gr
 
-from indextts.infer import IndexTTS
+# from indextts.infer import IndexTTS
+from indextts.infer_f16 import IndexTTS
 from tools.i18n.i18n import I18nAuto
 
 i18n = I18nAuto(language="zh_CN")
