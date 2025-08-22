@@ -35,7 +35,7 @@ if not os.path.exists(cmd_args.model_dir):
     sys.exit(1)
 
 for file in [
-    "indextts_bm1684x_f32_seq256.bmodel",
+    "indextts_bm1684x_f16_seq256.bmodel",
     "bpe.model",
     "config.yaml",
 ]:

@@ -27,14 +27,12 @@ source .venv/bin/activate
 ```bash
 cd checkpoints
 python -m dfss --url=open@sophgo.com:/ext_model_information/LLM/LLM-TPU/indextts_bm1684x_f16_seq256.bmodel
-# python -m dfss --url=open@sophgo.com:/ext_model_information/LLM/LLM-TPU/indextts_bm1684x_f32_seq256.bmodel
 ```
 
 4. Run test script:
 
 ```bash
 python indextts/infer_f16.py
-# python indextts/infer.py
 ```
 
 4. Run test web-demo:
@@ -47,26 +45,12 @@ Open your browser and visit `http://127.0.0.1:7860` to see the demo.
 
 5. Performance
 
-f16 (attn w4f16):
-
 ```sh
 >> Reference audio length: 1.07 seconds
->> gpt_gen_time: 13.97 seconds
->> gpt_forward_time: 0.35 seconds
->> bigvgan_time: 1.10 seconds
->> Total inference time: 15.89 seconds
->> Generated audio length: 41.13 seconds
->> RTF: 0.3864
-```
-
-f32 (attn f16):
-
-```sh
->> Reference audio length: 1.07 seconds
->> gpt_gen_time: 53.41 seconds
->> gpt_forward_time: 2.59 seconds
->> bigvgan_time: 1.10 seconds
->> Total inference time: 58.25 seconds
->> Generated audio length: 41.94 seconds
->> RTF: 1.3889
+>> gpt_gen_time: 18.84 seconds
+>> gpt_forward_time: 0.37 seconds
+>> bigvgan_time: 3.34 seconds
+>> Total inference time: 23.05 seconds
+>> Generated audio length: 52.69 seconds
+>> RTF: 0.4374
 ```

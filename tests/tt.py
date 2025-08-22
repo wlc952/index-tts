@@ -6,44 +6,44 @@ from transformers import LogitsProcessorList, TopPLogitsWarper, TopKLogitsWarper
 import torch.nn.functional as F
 import onnxruntime as ort
 
-# latent = np.load("latent_debug.npz")["latent"]
-# ori_ = latent.shape[1]
-# latent = np.pad(
-#     latent,
-#     ((0, 0), (0, 224 - latent.shape[1]), (0, 0)),
-#     mode="constant",
-#     constant_values=0,
-# )
+latent = np.load("latent_debug.npz")["latent"]
+ori_ = latent.shape[1]
+latent = np.pad(
+    latent,
+    ((0, 0), (0, 224 - latent.shape[1]), (0, 0)),
+    mode="constant",
+    constant_values=0,
+)
 
-# speaker_embedding = np.load("speaker_embedding.npz")["speaker_embedding"]
+speaker_embedding = np.load("speaker_embedding.npz")["speaker_embedding"]
 
-# model = EngineOV("checkpoints/bigvgan.bmodel")
+model = EngineOV("checkpoints/bigvgan.bmodel")
 
-# outputs = model([latent, speaker_embedding])[0]
-# print(f"outputs shape: {outputs.shape}")
-# wav = outputs[0]
-# print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
-# print(wav[:10])
-
-# original_wav_length = int(wav.shape[-1] * ori_ / 224)
-# wav = wav[:, :original_wav_length]      
-
-# wav = torch.from_numpy(wav)              
-# wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
-
-# torchaudio.save("test.wav", wav.type(torch.int16), 24000)
-
-
-
-
-input_states = np.load("checkpoints/emb_pad.npz")["input_states"]
-attention_mask = np.load("checkpoints/emb_pad.npz")["attention_mask"]
-model = EngineOV("checkpoints/indextts_bm1684x_seq256.bmodel")
-print(f"emb shape: {input_states.shape}, mask shape: {attention_mask.shape}")
-
-outputs = model([input_states, attention_mask])[0]
+outputs = model([latent, speaker_embedding])[0]
 print(f"outputs shape: {outputs.shape}")
-print(outputs[0,0,:10])
+wav = outputs[0]
+print(f"wav shape: {wav.shape}", "min:", wav.min(), "max:", wav.max())
+print(wav[:10])
+
+original_wav_length = int(wav.shape[-1] * ori_ / 224)
+wav = wav[:, :original_wav_length]      
+
+wav = torch.from_numpy(wav)              
+wav = torch.clamp(32767 * wav, -32767.0, 32767.0)
+
+torchaudio.save("test.wav", wav.type(torch.int16), 24000)
+
+
+
+
+# input_states = np.load("checkpoints/emb_pad.npz")["input_states"]
+# attention_mask = np.load("checkpoints/emb_pad.npz")["attention_mask"]
+# model = EngineOV("checkpoints/indextts_bm1684x_seq256.bmodel")
+# print(f"emb shape: {input_states.shape}, mask shape: {attention_mask.shape}")
+
+# outputs = model([input_states, attention_mask])[0]
+# print(f"outputs shape: {outputs.shape}")
+# print(outputs[0,0,:10])
 
 # model2 = EngineOV("checkpoints/lm_head.bmodel")
 # next_token_logits = model2([outputs[:,-1:,:]])[0]
