@@ -199,7 +199,7 @@ model_deploy.py \
 
 model_transform.py \
     --model_name bigvgan \
-    --model_def ${onnx_dir}/bigvgan_filter_approximated.onnx \
+    --model_def ${onnx_dir}/bigvgan.onnx \
     --mlir bigvgan.mlir
 
 model_deploy.py \

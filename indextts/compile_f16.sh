@@ -205,12 +205,12 @@ model_deploy.py \
 
 model_transform.py \
     --model_name bigvgan \
-    --model_def ${onnx_dir}/bigvgan_filter_approximated.onnx \
+    --model_def ${onnx_dir}/bigvgan.onnx \
     --mlir bigvgan.mlir
 
 model_deploy.py \
     --mlir bigvgan.mlir \
-    --quantize F16 \
+    --quantize W4F16 --q_group_size 64  \
     --chip ${chip} \
     --model bigvgan.bmodel
 
