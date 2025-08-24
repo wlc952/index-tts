@@ -13,7 +13,6 @@ from omegaconf import OmegaConf
 
 from indextts.BigVGAN.models import BigVGAN as Generator
 import indextts.BigVGAN.activations as activations
-from indextts.BigVGAN.alias_free_torch.filter import kaiser_sinc_filter1d
 
 try:
     import onnxruntime as ort
@@ -235,122 +234,6 @@ def verify_onnx_model(onnx_path, pytorch_model, test_inputs):
         print(f"   ❌ ONNX验证过程中出错: {str(e)}")
         return False
 
-    """导出NPU兼容的ONNX模型"""
-    print("=== BigVGAN NPU兼容 ONNX 导出 ===")
-    
-    # 创建NPU兼容模型
-    model = create_npu_compatible_model()
-    
-    # 准备测试数据
-    print("3. 准备测试数据...")
-    latent = torch.randn(1, 224, 1280)
-    # 限制输入范围
-    latent = torch.clamp(latent, -3.0, 3.0)
-    speaker_embedding = torch.randn(1, 512, 1)
-    speaker_embedding = torch.clamp(speaker_embedding, -3.0, 3.0)
-    
-    # 创建包装器
-    class NPUBigVGANWrapper(nn.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.model = model
-            self.eps = 1e-7
-            self.max_val = 2.0
-            self.min_val = -2.0
-        
-        def _safe_clamp(self, x, desc=""):
-            """安全的数值裁剪，包含异常值检查"""
-            # 检查异常值
-            if torch.isnan(x).any() or torch.isinf(x).any():
-                print(f"警告: 在{desc}检测到异常值，已清零")
-                x = torch.zeros_like(x)
-            
-            # 裁剪到安全范围
-            x = torch.clamp(x, self.min_val, self.max_val)
-            return x
-        
-        def forward(self, x, embedding):
-            # 输入范围极严格限制
-            x = self._safe_clamp(x, "输入x")
-            embedding = self._safe_clamp(embedding, "输入embedding")
-            
-            x = x.transpose(1, 2)
-            x = self._safe_clamp(x, "转置后")
-            
-            x = self.model.conv_pre(x)
-            x = self._safe_clamp(x, "conv_pre后")
-            
-            cond_out = self.model.cond_layer(embedding)
-            cond_out = self._safe_clamp(cond_out, "cond_layer后")
-            
-            x = x + cond_out
-            x = self._safe_clamp(x, "加cond后")
-            
-            for i in range(self.model.num_upsamples):
-                # upsampling
-                for i_up in range(len(self.model.ups[i])):
-                    x = self.model.ups[i][i_up](x)
-                    x = self._safe_clamp(x, f"up_{i}_{i_up}后")
-                
-                cond_up = self.model.conds[i](embedding)
-                cond_up = self._safe_clamp(cond_up, f"cond_{i}后")
-                
-                x = x + cond_up
-                x = self._safe_clamp(x, f"加cond_{i}后")
-                
-                # AMP blocks with safer aggregation
-                xs_list = []
-                for j in range(self.model.num_kernels):
-                    block_out = self.model.resblocks[i * self.model.num_kernels + j](x)
-                    block_out = self._safe_clamp(block_out, f"resblock_{i}_{j}后")
-                    xs_list.append(block_out)
-                
-                # 更安全的求平均
-                if xs_list:
-                    x = torch.stack(xs_list, dim=0).mean(dim=0)
-                    x = self._safe_clamp(x, f"resblock平均_{i}后")
-            
-            # post conv
-            x = self.model.activation_post(x)
-            x = self._safe_clamp(x, "activation_post后")
-            
-            x = self.model.conv_post(x)
-            x = self._safe_clamp(x, "conv_post后")
-            
-            # 最终tanh前再次限制到更小范围
-            x = torch.clamp(x, -0.99, 0.99)
-            x = torch.tanh(x)
-            
-            return x
-    
-    # 导出ONNX
-    os.makedirs("onnx", exist_ok=True)
-    wrapped_model = NPUBigVGANWrapper(model)
-    
-    print("4. 导出NPU兼容的ONNX模型...")
-    torch.onnx.export(
-        wrapped_model,
-        (latent, speaker_embedding),
-        "onnx/bigvgan_npu_compatible.onnx",
-        input_names=["latent", "speaker_embedding"],
-        output_names=["audio"],
-        opset_version=11,  # 使用更低版本以提高NPU兼容性
-        do_constant_folding=True,
-        verbose=False,
-        dynamic_axes=None,  # 禁用动态轴
-        export_params=True,
-        keep_initializers_as_inputs=False,
-        training=torch.onnx.TrainingMode.EVAL
-    )
-    print("   NPU兼容ONNX模型导出成功！")
-    
-    # 验证模型
-    if ONNX_AVAILABLE:
-        print("5. 验证NPU兼容模型...")
-        verify_onnx_model("onnx/bigvgan_npu_compatible.onnx", wrapped_model, (latent, speaker_embedding))
-    
-    return True
-
 
 def export_ultimate_onnx():
     print("=== BigVGAN ONNX 导出 ===")
@@ -503,19 +386,59 @@ def export_ultimate_onnx():
         def __init__(self, model):
             super().__init__()
             self.model = model
+
+        def _match_time(self, cond: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
+            """Tile cond on time axis to match x to avoid broadcast add at export."""
+            if cond.dim() >= 3:
+                t = x.shape[-1]
+                if cond.shape[-1] == t:
+                    return cond
+                if cond.shape[-1] == 1:
+                    return cond.repeat(1, 1, t)
+                # Fallback crop/pad
+                if cond.shape[-1] > t:
+                    return cond[..., :t]
+                pad = t - cond.shape[-1]
+                return torch.nn.functional.pad(cond, (0, pad))
+            return cond
         
+        def _safe_add_4d(self, x: torch.Tensor, y: torch.Tensor, max_w: int = 256) -> torch.Tensor:
+            """Numerically identical to x + y, but reshape T to HxW with small W to avoid backend stride limits."""
+            y = self._match_time(y, x)
+            n, c, t = x.shape
+            pad_len = (max_w - (t % max_w)) % max_w
+            if pad_len > 0:
+                x_pad = torch.nn.functional.pad(x, (0, pad_len))
+                y_pad = torch.nn.functional.pad(y, (0, pad_len))
+            else:
+                x_pad = x
+                y_pad = y
+            t_pad = x_pad.shape[-1]
+            h = t_pad // max_w
+            x4 = x_pad.view(n, c, h, max_w)
+            y4 = y_pad.view(n, c, h, max_w)
+            z4 = x4 + y4
+            z = z4.reshape(n, c, t_pad)
+            if pad_len > 0:
+                z = z[..., :t]
+            return z
+
         def forward(self, x, emdedding):
             x = x.transpose(1, 2)  # 转置以匹配输入形状
             x = self.model.conv_pre(x)
 
-            x = x + self.model.cond_layer(speaker_embedding)
+            # 使用传入的嵌入张量，而不是外部变量，避免将 speaker_embedding 固定为常量
+            cond0 = self.model.cond_layer(emdedding)
+            x = self._safe_add_4d(x, cond0, max_w=256)
 
             for i in range(self.model.num_upsamples):
                 # upsampling
                 for i_up in range(len(self.model.ups[i])):
                     x = self.model.ups[i][i_up](x)
 
-                x = x + self.model.conds[i](speaker_embedding)
+                # 同样使用传入的嵌入张量
+                condi = self.model.conds[i](emdedding)
+                x = self._safe_add_4d(x, condi, max_w=256)
 
                 # AMP blocks
                 xs = None
@@ -547,212 +470,40 @@ def export_ultimate_onnx():
     print("   BigVGAN 主模型导出成功！")
     
     # 7. 验证ONNX模型
-    print("\n=== ONNX模型验证 ===")
-    verify_success = verify_onnx_model("onnx/bigvgan.onnx", wrapped_model, (latent, speaker_embedding))
+    # print("\n=== ONNX模型验证 ===")
+    # verify_success = verify_onnx_model("onnx/bigvgan.onnx", wrapped_model, (latent, speaker_embedding))
     
-    if verify_success:
-        print("   🎉 ONNX模型验证通过！")
-    else:
-        print("   ⚠️ ONNX模型验证未通过，建议检查模型")
+    # if verify_success:
+    #     print("   🎉 ONNX模型验证通过！")
+    # else:
+    #     print("   ⚠️ ONNX模型验证未通过，建议检查模型")
 
-    return True
+    # # 8. 生成测试输入/输出 NPZ，供后续对比使用
+    # try:
+    #     # 保存测试输入
+    #     np.savez("bigvgan_test_input.npz", latent=latent.numpy(), speaker_embedding=speaker_embedding.numpy())
+    #     print("   ✅ 已保存测试输入: bigvgan_test_input.npz")
+    #     # 保存参考输出
+    #     if ONNX_AVAILABLE:
+    #         ort_session = ort.InferenceSession("onnx/bigvgan.onnx")
+    #         input_names = [i.name for i in ort_session.get_inputs()]
+    #         output_names = [o.name for o in ort_session.get_outputs()]
+    #         outs = ort_session.run(output_names, {
+    #             input_names[0]: latent.numpy(),
+    #             input_names[1]: speaker_embedding.numpy(),
+    #         })
+    #         np.savez("bigvgan_test_output.npz", **{output_names[0]: outs[0]})
+    #         print("   ✅ 已保存测试输出: bigvgan_test_output.npz (键名为 ONNX 输出名)")
+    #     else:
+    #         print("   ⚠️ 未安装 onnxruntime，跳过保存测试输出")
+    # except Exception as e:
+    #     print(f"   ❌ 生成测试 NPZ 失败: {e}")
 
-
-def export_approximated_filter_onnx():
-    """滤波器近似方案：用静态卷积近似原始滤波器"""
-    print("=== BigVGAN 滤波器近似 ONNX 导出 ===")
-    
-    # 1. 加载模型
-    print("1. 加载原始模型...")
-    cfg = OmegaConf.load("checkpoints/config.yaml")
-    model = Generator(cfg.bigvgan, use_cuda_kernel=False)
-    checkpoint = torch.load("checkpoints/bigvgan_generator.pth", map_location="cpu")
-    model.load_state_dict(checkpoint["generator"])
-    model.eval()
-    model.remove_weight_norm()
-    
-    # 2. 创建静态滤波器近似
-    class StaticFilterActivation1d(nn.Module):
-        def __init__(self, original_activation, expected_channels):
-            super().__init__()
-            
-            # 保持激活函数
-            if isinstance(original_activation.act, activations.SnakeBeta):
-                self.act = MinimalSnakeBeta(original_activation.act)
-            else:
-                self.act = original_activation.act
-            
-            # 创建静态抗混叠滤波器
-            # 使用简单的低通滤波器近似原始的复杂滤波器
-            kernel_size = 5  # 较小的核，NPU友好
-            self.channels = expected_channels
-            
-            # 创建低通滤波器权重（汉宁窗）
-            window = torch.hann_window(kernel_size)
-            window = window / window.sum()
-            
-            # 扩展到所有通道
-            filter_weight = window.view(1, 1, kernel_size).expand(expected_channels, 1, kernel_size)
-            
-            # 创建静态卷积层
-            self.anti_alias_filter = nn.Conv1d(
-                in_channels=expected_channels,
-                out_channels=expected_channels,
-                kernel_size=kernel_size,
-                padding=kernel_size // 2,
-                groups=expected_channels,
-                bias=False
-            )
-            
-            # 设置滤波器权重
-            with torch.no_grad():
-                self.anti_alias_filter.weight.copy_(filter_weight)
-        
-        def forward(self, x):
-            # 如果通道数不匹配，使用简单的激活
-            if x.shape[1] != self.channels:
-                return self.act(x)
-            
-            # 应用激活函数
-            x_activated = self.act(x)
-            
-            # 应用静态抗混叠滤波
-            x_filtered = self.anti_alias_filter(x_activated)
-            
-            # 与原始信号混合，保持大部分激活特性
-            x = x_activated * 0.8 + x_filtered * 0.2
-            
-            return x
-    
-    class MinimalSnakeBeta(nn.Module):
-        def __init__(self, original_snakebeta):
-            super().__init__()
-            self.in_features = original_snakebeta.in_features
-            self.alpha_logscale = original_snakebeta.alpha_logscale
-            self.no_div_by_zero = original_snakebeta.no_div_by_zero
-            self.alpha = nn.Parameter(original_snakebeta.alpha.data.clone())
-            self.beta = nn.Parameter(original_snakebeta.beta.data.clone())
-    
-        def forward(self, x):
-            alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
-            beta = self.beta.unsqueeze(0).unsqueeze(-1)
-            
-            if self.alpha_logscale:
-                alpha = torch.exp(alpha)
-                beta = torch.exp(beta)
-            
-            x = x + (1.0 / (beta + self.no_div_by_zero)) * torch.pow(torch.sin(x * alpha), 2)
-            return x
-    
-    # 3. 替换模块，包括通道数映射
-    print("2. 替换为静态滤波器近似...")
-    
-    # BigVGAN的通道数映射（根据网络结构）
-    channels_map = {
-        'activation_post': 24,  # 最后一层
-        'resblocks.0': 768, 'resblocks.1': 768, 'resblocks.2': 768,
-        'resblocks.3': 384, 'resblocks.4': 384, 'resblocks.5': 384,
-        'resblocks.6': 192, 'resblocks.7': 192, 'resblocks.8': 192,
-        'resblocks.9': 96, 'resblocks.10': 96, 'resblocks.11': 96,
-        'resblocks.12': 48, 'resblocks.13': 48, 'resblocks.14': 48,
-        'resblocks.15': 24, 'resblocks.16': 24, 'resblocks.17': 24,
-    }
-    
-    def get_expected_channels(module_path):
-        """根据模块路径获取期望的通道数"""
-        for key, channels in channels_map.items():
-            if key in module_path:
-                return channels
-        return 512  # 默认值
-    
-    def replace_with_static_filter(module, module_path=""):
-        for name, child in module.named_children():
-            current_path = f"{module_path}.{name}" if module_path else name
-            
-            if isinstance(child, activations.SnakeBeta):
-                setattr(module, name, MinimalSnakeBeta(child))
-                print(f"   替换了 SnakeBeta: {current_path}")
-            elif hasattr(child, '__class__') and 'Activation1d' in child.__class__.__name__:
-                expected_channels = get_expected_channels(current_path)
-                setattr(module, name, StaticFilterActivation1d(child, expected_channels))
-                print(f"   替换了 Activation1d: {current_path} (通道数: {expected_channels})")
-            else:
-                replace_with_static_filter(child, current_path)
-    
-    replace_with_static_filter(model)
-    
-    # 4. 包装器
-    class FilterApproximatedWrapper(nn.Module):
-        def __init__(self, model):
-            super().__init__()
-            self.model = model
-        
-        def forward(self, x, embedding):
-            x = x.transpose(1, 2)
-            x = self.model.conv_pre(x)
-            x = x + self.model.cond_layer(embedding)
-            
-            for i in range(self.model.num_upsamples):
-                for up_layer in self.model.ups[i]:
-                    x = up_layer(x)
-                
-                x = x + self.model.conds[i](embedding)
-                
-                xs = None
-                for j in range(self.model.num_kernels):
-                    if xs is None:
-                        xs = self.model.resblocks[i * self.model.num_kernels + j](x)
-                    else:
-                        xs += self.model.resblocks[i * self.model.num_kernels + j](x)
-                x = xs / self.model.num_kernels
-            
-            x = self.model.activation_post(x)
-            x = self.model.conv_post(x)
-            x = torch.tanh(x)
-            
-            return x
-    
-    # 5. 准备测试数据
-    print("3. 准备测试数据...")
-    torch.manual_seed(42)
-    latent = torch.randn(1, 224, 1280)
-    speaker_embedding = torch.randn(1, 512, 1)
-    
-    # 6. 导出模型
-    os.makedirs("onnx", exist_ok=True)
-    wrapped_model = FilterApproximatedWrapper(model)
-    
-    print("4. 导出滤波器近似ONNX模型...")
-    torch.onnx.export(
-        wrapped_model,
-        (latent, speaker_embedding),
-        "onnx/bigvgan_filter_approximated.onnx",
-        input_names=["latent", "speaker_embedding"],
-        output_names=["audio"],
-        opset_version=14,
-        do_constant_folding=True,
-        verbose=False,
-        dynamic_axes=None,
-        export_params=True,
-        keep_initializers_as_inputs=False,
-        training=torch.onnx.TrainingMode.EVAL
-    )
-    print("   滤波器近似ONNX模型导出成功！")
-    
     return True
 
 
 if __name__ == "__main__":
-    # print("🔄 开始导出标准ONNX模型...")
-    # success = export_ultimate_onnx()
-    # if success:
-    #     print("\n✅ 标准ONNX模型导出成功！")
-    print("\n🔄 方案2: 滤波器近似 - 用静态滤波器近似原始滤波器...")
-    try:
-        filter_success = export_approximated_filter_onnx()
-        if filter_success:
-            print("✅ 滤波器近似导出成功！这是滤波器和NPU兼容性的折中方案")
-        else:
-            print("❌ 滤波器近似导出失败")
-    except Exception as e:
-        print(f"❌ 滤波器近似导出异常: {e}")
+    print("🔄 开始导出标准ONNX模型...")
+    success = export_ultimate_onnx()
+    if success:
+        print("\n✅ 标准ONNX模型导出成功！")

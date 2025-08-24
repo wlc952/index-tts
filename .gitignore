@@ -21,3 +21,4 @@ test.wav
 test.py
 *.npz
 tmp
+*npy
